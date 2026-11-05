@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Added a public-URL watchdog. A dead edge connection — typically a quick tunnel whose server-side record is
+  gone (`Unauthorized: Tunnel not found`) — makes cloudflared retry forever without exiting, so the supervisor
+  used to keep reporting `ready` while the share link answered 502/530/1033. It now probes the public URL every
+  `healthCheckMs` (default 15s, `0` disables), accepts only answers that came from this Host (200/303/401/403),
+  and restarts cloudflared after `healthFailures` (default 3) consecutive misses, which mints a fresh quick
+  tunnel and link. `status` gained `health: { checkedAt, ok, failures, restarts }`, `healthCheckMs` and
+  `healthFailures`; `healthCheckTimeoutMs` (default 8s) bounds one probe. Resolution failures during the first
+  `healthDnsGraceMs` (default 120s) of a fresh quick tunnel are treated as inconclusive instead of unhealthy: a
+  brand-new trycloudflare hostname can take a minute to resolve, and restarting cannot fix DNS.
+
 ## 0.2.0 — 2026-10-30
 
 - DSH Desktop `0.2.1-rc.3` removed the host browser-access gate: `webServer.setBrowserAccess()` no longer

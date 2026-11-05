@@ -276,6 +276,10 @@ SSH 里，不经过 Cloudflare。
 | `logLines` | `200` | 内存日志环形缓冲行数 |
 | `keepAliveMs` | `65000` | 把 Host 的 `node:http` `keepAliveTimeout` 抬到多少毫秒（`0` = 不动），见 §8 |
 | `proxyKeepAliveMs` | `keepAliveMs - 5000` | 传给 cloudflared 的 `--proxy-keepalive-timeout`，必须短于 origin keep-alive |
+| `healthCheckMs` | `15000` | 公网 URL 健康检查间隔（`0` = 关闭）：只有落到 Host 的 200/303/401/403 算健康，见 §8 |
+| `healthCheckTimeoutMs` | `8000` | 单次健康检查的超时 |
+| `healthFailures` | `3` | 连续失败多少次后重启 cloudflared（quick 隧道会换新地址与链接） |
+| `healthDnsGraceMs` | `120000` | 新 quick 域名刚生成时 DNS 可能还没生效；这段时间的解析失败（`ENOTFOUND`/`EAI_AGAIN`）不计入失败 |
 | `tunnelLogLevel` | `info` | 传给 cloudflared 的 `--loglevel`（`debug` 能看清边缘连接细节） |
 | `tunnelLogBytes` | `1000000` | 日志超过这个字节数就滚成 `tunnel.log.1` |
 | `home` | 自动探测 | 强制指定 `DSH_HOME` |
@@ -289,7 +293,7 @@ SSH 里，不经过 Cloudflare。
 闪断不会丢任务。
 
 公网路径上「pong 迟到」比「链路断开」更常见：浏览器标签页被节流、网络切换、边缘连接被回收，都可能连续
-错过两次心跳。插件为此做了四件事（前两项需要**重启一次 Desktop** 才生效）：
+错过两次心跳。插件为此先做了四件事（前两项需要**重启一次 Desktop** 才生效）：
 
 1. **放宽心跳**：安装器往 profile 补丁写一段受管的 `typert-gateway` 覆盖，把 `websocketHeartbeatIntervalMs`
    从 2000 调到 15000——要连丢两次包得跨 30 秒才致命；
@@ -301,6 +305,15 @@ SSH 里，不经过 Cloudflare。
    证据可查，而不是只有一个内存环。
 
 这些手段只能降低「重新连接中」的概率，不能消除：公网隧道本身会抖。
+
+还有一类故障不走「重新连接中」：cloudflared 的进程不退出，但它和边缘的连接已经作废——典型是 quick 隧道在
+Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel not found`。这时面板仍显示「已就绪」，链接
+却只会返回 502/530/1033。插件为此再做了第五件事：
+
+5. **公网 URL 看门狗**：隧道就绪后每 `healthCheckMs`（默认 15s）请求一次公网地址，不带令牌；只有拿到 Host
+   的应答（401 是健康答案，200/303/403 也算通）才记为健康。连续 `healthFailures`（默认 3）次失败就杀掉
+   cloudflared 并重新拉起——quick 隧道会生成新地址、写一份新链接。新域名刚生成时 DNS 可能还没生效，这段时间的
+   解析失败不算失败（`healthDnsGraceMs`，默认 120s），否则换了新域名反而会被自己误杀。`healthCheckMs: 0` 可以关掉它。
 
 ## 9. 运行时文件
 
@@ -390,8 +403,11 @@ equivalent to full control of the host machine — treat it as a secret, and sto
 Because the GUI talks to the Host over a single WebSocket that is pinged every 2s and killed after two missed
 pongs, the installer writes a managed `typert-gateway` override (`websocketHeartbeatIntervalMs: 15000`) into
 the profile patch, passes `--proxy-keepalive-timeout 60s` to cloudflared, raises the origin `keepAliveTimeout`
-(`keepAliveMs`, default 65s) and rotates tunnel logs on disk. The first two need one Desktop restart. These
-measures reduce, but cannot eliminate, transient reconnects on a public tunnel.
+(`keepAliveMs`, default 65s) and rotates tunnel logs on disk. The first two need one Desktop restart. The
+supervisor also polls the public URL itself (`healthCheckMs`, 15s) and restarts cloudflared after
+`healthFailures` (3) consecutive misses, because a dead edge connection — a quick tunnel whose record is gone,
+for instance — retries forever without exiting and would otherwise leave a "ready" panel behind a URL that
+answers 502/530/1033. These measures reduce, but cannot eliminate, transient reconnects on a public tunnel.
 
 The plugin is developed and validated on macOS. The tunnel service, the trusted-host fence and the settings
 panel are plain Node/DOM code, so a Windows host works too once the plugin is installed with `dsh plugin add`

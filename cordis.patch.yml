@@ -20,3 +20,7 @@
         protocol: http2
         # cloudflared 默认 90s；origin 是 65s，必须让代理池先过期
         proxyKeepAliveMs: 60000
+        # 公网 URL 看门狗：15s 探一次，连续 3 次不通就重启 cloudflared
+        # （quick 隧道会换一个新地址和新链接）；healthCheckMs: 0 可关掉
+        healthCheckMs: 15000
+        healthFailures: 3

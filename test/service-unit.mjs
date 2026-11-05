@@ -12,7 +12,7 @@ import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { dispatch } from '../lib/http.js'
-import { planTunnel } from '../lib/tunnel.js'
+import { isDnsResolutionError, isHealthyTunnelStatus, planTunnel } from '../lib/tunnel.js'
 import { RemoteAccessService, normalizeConfig } from '../lib/service.js'
 import { createLogger, locateHome } from '../lib/util.js'
 
@@ -87,6 +87,35 @@ async function main() {
     check('locateHome falls back to ~/.dsh outside a profile manifest', located.home === path.join(homedir(), '.dsh'), located.home)
     check('autoStart defaults to false', normalizeConfig({}).autoStart === false, String(normalizeConfig({}).autoStart))
     check('autoStart true is honored', normalizeConfig({ autoStart: true }).autoStart === true, String(normalizeConfig({ autoStart: true }).autoStart))
+    const healthDefaults = normalizeConfig({})
+    check('the tunnel watchdog is on by default', healthDefaults.healthCheckMs === 15_000, String(healthDefaults.healthCheckMs))
+    check('the watchdog waits for three failed checks', healthDefaults.healthFailures === 3, String(healthDefaults.healthFailures))
+    check('the watchdog has a timeout', healthDefaults.healthCheckTimeoutMs === 8_000, String(healthDefaults.healthCheckTimeoutMs))
+    check(
+      'DNS lag after a fresh quick tunnel is not treated as a dead URL',
+      healthDefaults.healthDnsGraceMs === 120_000 && normalizeConfig({ healthDnsGraceMs: 0 }).healthDnsGraceMs === 0,
+      String(healthDefaults.healthDnsGraceMs)
+    )
+    check('healthCheckMs: 0 turns the watchdog off', normalizeConfig({ healthCheckMs: 0 }).healthCheckMs === 0, String(normalizeConfig({ healthCheckMs: 0 }).healthCheckMs))
+    check('the watchdog interval has a floor', normalizeConfig({ healthCheckMs: 1000 }).healthCheckMs === 5_000, String(normalizeConfig({ healthCheckMs: 1000 }).healthCheckMs))
+    check(
+      'a Host answer counts as a healthy probe',
+      [200, 303, 401, 403].every((code) => isHealthyTunnelStatus(code)),
+      'host statuses'
+    )
+    check(
+      'a resolution failure is recognised',
+      isDnsResolutionError({ cause: { code: 'ENOTFOUND' } }) &&
+        isDnsResolutionError(Object.assign(new Error('fetch failed'), { code: 'EAI_AGAIN' })) &&
+        !isDnsResolutionError(new Error('fetch failed')) &&
+        !isDnsResolutionError(null),
+      'dns codes'
+    )
+    check(
+      'an edge failure is never a healthy probe',
+      ![0, 500, 502, 503, 530, 1033].some((code) => isHealthyTunnelStatus(code)),
+      'edge statuses'
+    )
 
     /* 1 — status carries a loopback link minted for the ssh -L route */
     const primary = buildService({ home })
@@ -98,6 +127,11 @@ async function main() {
       JSON.stringify(status.access)
     )
     check('target is the loopback origin', status.target === 'http://127.0.0.1:18790', String(status.target))
+    check(
+      'status discloses the watchdog and its last result',
+      status.health === null && status.healthCheckMs === 15_000 && status.healthFailures === 3,
+      JSON.stringify({ health: status.health, healthCheckMs: status.healthCheckMs, healthFailures: status.healthFailures })
+    )
     check('no trusted hosts before publish', status.trustedHosts.length === 0, JSON.stringify(status.trustedHosts))
     const runtimeTrust = buildService({ home })
     runtimeTrust.service.publishTrustedHosts()
