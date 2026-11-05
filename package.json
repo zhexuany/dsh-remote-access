@@ -1,0 +1,63 @@
+{
+  "name": "dsh-remote-access",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Remote access: expose the local DSH Harness Web GUI through a secure tunnel",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "remote-access",
+    "cloudflare-tunnel"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhexuany/dsh-remote-access.git"
+  },
+  "homepage": "https://github.com/zhexuany/dsh-remote-access#readme",
+  "bugs": {
+    "url": "https://github.com/zhexuany/dsh-remote-access/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node test/service-unit.mjs && node test/installer-unit.mjs",
+    "test:service": "node test/service-unit.mjs",
+    "test:installer": "node test/installer-unit.mjs",
+    "test:client": "node test/client-smoke.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "icon": "./icon.svg",
+  "bin": {
+    "dsh-remote-access": "./bin/dsh-remote-access",
+    "dsh-remote-access-install": "./bin/install"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "lib",
+    "locale",
+    "bin",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

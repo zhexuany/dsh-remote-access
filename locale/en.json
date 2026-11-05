@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote access",
+    "description": "Expose this machine's DSH Harness Web GUI to a browser on another network through a tunnel, with a switch and a share link in Settings → Plugins."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "远程协作",
+    "description": "用隧道把本机的 DSH Harness Web GUI 暴露给另一台机器上的浏览器，并在 设置 → 插件 里提供开关与连接链接。"
+  }
+}

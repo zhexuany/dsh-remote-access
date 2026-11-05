@@ -1,0 +1,29 @@
+#!/bin/sh
+# dsh-remote-access — CLI wrapper.
+#
+# The DSH Desktop app ships its own Node runtime, so this wrapper runs the CLI
+# through `ELECTRON_RUN_AS_NODE=1 "<DSH NEXT>"` when no `node` is on PATH.
+set -e
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+
+APP="${DSH_NEXT_APP:-}"
+if [ -z "$APP" ]; then
+  for candidate in "/Applications/DSH NEXT.app" "$HOME/Applications/DSH NEXT.app"; do
+    if [ -x "$candidate/Contents/MacOS/DSH NEXT" ]; then
+      APP="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -n "$APP" ] && [ -x "$APP/Contents/MacOS/DSH NEXT" ]; then
+  exec env ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DSH NEXT" "$SELF_DIR/cli.mjs" "$@"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  exec node "$SELF_DIR/cli.mjs" "$@"
+fi
+
+echo "dsh-remote-access: no DSH Desktop app and no node runtime found (set DSH_NEXT_APP to the .app path)" >&2
+exit 127

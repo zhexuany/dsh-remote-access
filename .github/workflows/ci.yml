@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # the plugin targets macOS (DSH Harness Desktop), so test where it runs
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Syntax check
+        run: |
+          node --version
+          node --check index.js
+          node --check client.js
+          node --check lib/service.js
+          node --check lib/http.js
+          node --check lib/tunnel.js
+          node --check lib/util.js
+          node --check lib/fence.js
+          node --check bin/cli.mjs
+          node --check bin/install.mjs
+
+      - name: Host service unit tests
+        run: node test/service-unit.mjs
+
+      - name: Installer unit tests
+        run: node test/installer-unit.mjs
+
+      - name: Client panel smoke (offline)
+        run: node test/client-smoke.mjs

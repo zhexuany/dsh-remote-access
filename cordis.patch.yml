@@ -1,0 +1,22 @@
+# 远程协作（dsh-remote-access）
+#
+# 这一行把插件插入 profile 的插件树；
+# 下面的 config 就是插件的默认配置，也可以直接在这里改。
+# 运行状态（启动/停止）由「设置 → 远程协作」面板或 CLI 控制，会记在
+# <DSH_HOME>/remote-access/state.json 里，不需要改这个文件。
+- insert:
+    # Distinct from the base layer's `remote-access` row, which mounts
+    # @deepseek-ai/dsh-api-remote-access and owns the `remoteAccess` service
+    # plus its Client half. Reusing that id would shadow the base row.
+    - id: dsh-remote-access
+      name: dsh-remote-access
+      config:
+        enabled: true
+        # 共享安装默认不自动开公网隧道；需要时在「远程协作」面板点启动。
+        # 想开机自启，可在 profile 的 cordis.patch.yml 用同一 id 覆盖为 true。
+        autoStart: false
+        provider: cloudflare-quick
+        # UDP/QUIC 被屏蔽的环境必须用 http2；能走 UDP 时可改为 quic / auto
+        protocol: http2
+        # cloudflared 默认 90s；origin 是 65s，必须让代理池先过期
+        proxyKeepAliveMs: 60000
