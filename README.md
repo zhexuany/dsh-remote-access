@@ -286,6 +286,9 @@ SSH 里，不经过 Cloudflare。
 | `muxCompressionThresholdBytes` | `1024` | 小于该字节数的下行帧不压缩（128–1048576） |
 | `muxHandshakeTimeoutMs` | `8000` | 压缩代理连本机 mux 的握手超时 |
 | `initialWindowMessages` | `60` | 首次打开会话请求的消息上限（DSH 默认 500）；`0` 表示不改，翻历史按页加载 |
+| `stripStreamingReplay` | `true` | 压缩前把历史消息里回放的 `data.stream` 事件置空（−48% 体积），只影响经 mux 代理的下行帧 |
+| `muxChunkBytes` | `262144` | 压缩后的帧再切成多大的 `DSHD1` 分块（16 KiB–1 MiB）；避免单条巨帧卡住隧道 |
+| `rpcCacheMs` | `30000` | 切换会话时只读 RPC（skills/commands/agentPresets 等 6 个）的客户端缓存 TTL；`0` = 关闭 |
 | `tunnelLogLevel` | `info` | 传给 cloudflared 的 `--loglevel`（`debug` 能看清边缘连接细节） |
 | `tunnelLogBytes` | `1000000` | 日志超过这个字节数就滚成 `tunnel.log.1` |
 | `home` | 自动探测 | 强制指定 `DSH_HOME` |
@@ -332,7 +335,7 @@ WebSocket 文本帧到达。DSH 默认最多 500 条消息；大会话里这条�
    回显 `Sec-WebSocket-Extensions`，扩展协商被静默丢弃——窗口以未压缩 JSON 过隧道；
 2. 隧道有效上行带宽实测约 0.65–0.8 MB/s，1 MB 窗口约 1.3–1.6s，10 MB 量级要十几秒。
 
-插件为此加了两件事（默认都开，可分别关闭）：
+插件为此加了四件事（默认都开，可分别关闭）：
 
 1. **mux 压缩代理**：Host 新增 upgrade 路由 `/remote-access/mux`。浏览器插件把发往 `/api/remote.mux`
    的连接改道到这里（带 `?deflate=1`），代理经回环连真正的 mux（转发同一个 Cookie，鉴权仍由网关完成），
@@ -342,11 +345,24 @@ WebSocket 文本帧到达。DSH 默认最多 500 条消息；大会话里这条�
 2. **缩小初始窗口**：客户端把 `follow` / `loadOlder` 的 `maxMessages` 压到 `initialWindowMessages`
    （默认 60）。往前翻历史时按页补拉，每次多一个往返；想少翻页可以把它调大。
 
-在 700 KB/s + 80 ms 的模拟链路上，同一会话的首个窗口从 2.8s 降到 2.2s，另一个会话从 3.3s 降到 1.1s
-（大会话的首帧时间还受 Host 冷读 zstd 文件影响，所以收益不是线性的）。`status` 里的 `mux` 块给出
-`downlinkRawBytes` / `compressedBytes` / `compressedFrames` 等计数，可以确认压缩是否在生效。
+3. **剥掉流式回放**：历史窗口里 `assistant/message` 的 `data.stream`（每个 token 的流式事件）占真实
+   窗口体积的约一半，而浏览器只把它当 usage 兜底、`data.usage` 本身完整存在。Host 在压缩前把这类
+   `data.stream` 置为 `[]`（不是删除：客户端轨迹折叠会 `for...of` 它），单条 2.6 MB 帧从 2.6 MB 降到
+   1.3 MB；`stripStreamingReplay: false` 可关闭。
+4. **分块下行**：压缩后的帧按 `muxChunkBytes`（默认 256 KiB）切成带 `DSHD1 <idx> <total>` 头的二进制
+   帧，浏览器侧按序重组后一次解压。单条巨帧不再独占隧道，也让首屏不必等整帧到齐；块大小可调，
+   16 KiB 的极端配置已在真实隧道 + Chrome 里验证（内容正常渲染、无 1011 断连）。
+5. **只读 RPC 缓存**：每次切换还会串行发 5–6 个 HTTP RPC（skills/commands/agentPresets 等）。客户端在
+   `connection.rpc.call` 上加了 30s、按 payload 区分的缓存（`rpcCacheMs`，只缓存 `ok === true` 的 6 个
+   只读端点，副作用调用永不缓存），把这条串行链从链路上拿掉。
 
-这两个补丁都在浏览器侧落地：更新 Host 代码后需要重启一次 Desktop，并硬刷新浏览器页面。
+把这几项叠加后，同一会话窗口的线上字节数约为原始窗口的 8–10%：2.6 MB 的样本帧剥流后 1.3 MB，
+deflate 后 266 KB，实测隧道下行一条 1.1 MB 窗口只用 ~115 KB（E2E 里 `wsInBytes` 约 153 KB，含其它帧）。
+在 700 KB/s + 80 ms 的模拟链路上，同一会话的首个窗口从 2.8s 降到 1.1s 量级；大会话的首帧时间还受
+Host 冷读 zstd 文件影响，收益不是线性的。`status` 里的 `mux` 块给出 `downlinkRawBytes` /
+`downlinkWireBytes` / `compressedBytes` / `strippedFrames` / `chunksSent` 等计数，可以确认链路在生效。
+
+这些补丁都在浏览器侧落地：更新 Host 代码后需要重启一次 Desktop，并硬刷新浏览器页面。
 
 ## 10. 运行时文件
 
@@ -444,10 +460,13 @@ answers 502/530/1033. These measures reduce, but cannot eliminate, transient rec
 
 Switching conversations is the other slow path: the initial history window (up to 500 messages, 1–11 MB in
 large sessions) arrives as one uncompressed WebSocket frame, because Cloudflare's edge drops the gateway's
-`permessage-deflate` offer. The Host therefore serves a sibling mux route (`/remote-access/mux`) that deflates
-large downlink frames (≈5× on a 1.1 MB window), and the client half narrows the initial window to
-`initialWindowMessages` (default 60) and inflates frames with `DecompressionStream`. Both are best-effort and
-fall back to the direct gateway path; see README §9 for numbers and configuration.
+`permessage-deflate` offer. The Host therefore serves a sibling mux route (`/remote-access/mux`) that neutralises the
+replayed `data.stream` events (about half of a real window), deflates what is left, and splits the result into
+bounded `DSHD1` chunks; the client half narrows the initial window to `initialWindowMessages` (default 60),
+reassembles and inflates chunks with `DecompressionStream`, and memoises the read-only RPCs a switch issues
+(`rpcCacheMs`, default 30s). Measured payload drops to roughly 8–10% of the original window (a 2.6 MB frame →
+~266 KB after deflate, ~115 KB on the wire for a 1.1 MB window). Everything is best-effort and falls back to
+the direct gateway path; see README §9 for numbers and configuration.
 
 The plugin is developed and validated on macOS. The tunnel service, the trusted-host fence and the settings
 panel are plain Node/DOM code, so a Windows host works too once the plugin is installed with `dsh plugin add`

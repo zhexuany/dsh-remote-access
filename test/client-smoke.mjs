@@ -27,6 +27,7 @@ import os from 'node:os'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { deflateRawSync } from 'node:zlib'
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 /** Prefer the app that is actually installed; the module table only exists in a real install. */
@@ -187,12 +188,16 @@ function installGlobals(registration) {
   return captured
 }
 
-async function loadBundle(captured, moduleTable) {
-  const requireShim = (spec) => {
+function makeRequireShim(captured, moduleTable) {
+  return (spec) => {
     captured.requires.push(spec)
     if (spec in moduleTable) return moduleTable[spec]
     throw new Error(`client-modules: require("${spec}") missed the module table (test harness)`)
   }
+}
+
+async function loadBundle(captured, moduleTable) {
+  const requireShim = makeRequireShim(captured, moduleTable)
   await import(path.join(PACKAGE_ROOT, 'client.js'))
   if (!captured.registration) throw new Error('client.js did not call window.__ModuleLoader__.load')
   return captured.registration.factory(requireShim)
@@ -437,6 +442,189 @@ async function main() {
     check('the banner clears once access is healthy again', !/探测被 403 拒绝/.test(text), text.slice(0, 300))
     check('no request used GET with a body', requests.every((entry) => entry.method !== 'GET' || entry.body === null))
   }
+
+  /* 7 — downlink framing: DSHD1 chunks and the legacy whole-frame shape */
+  const defineGlobal = (name, value) =>
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true })
+  const ticks = async (rounds = 8) => {
+    for (let index = 0; index < rounds; index += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  class FakeSocket {
+    constructor(url) {
+      this.url = url
+      this.handlers = new Map()
+      this.sent = []
+      this.closed = null
+    }
+    addEventListener(type, handler) {
+      if (!this.handlers.has(type)) this.handlers.set(type, new Set())
+      this.handlers.get(type).add(handler)
+    }
+    removeEventListener(type, handler) {
+      this.handlers.get(type)?.delete(handler)
+    }
+    send(data) {
+      this.sent.push(data)
+    }
+    close(code, reason) {
+      this.closed = { code, reason }
+    }
+    emit(type, event) {
+      for (const handler of this.handlers.get(type) ?? []) handler(event)
+    }
+  }
+
+  const decodeErrors = []
+  const originalConsoleError = console.error
+  console.error = (...parts) => {
+    decodeErrors.push(parts.map(String).join(' '))
+  }
+
+  const sockets = []
+  defineGlobal('location', { hostname: 'smoke.trycloudflare.com', protocol: 'https:' })
+  defineGlobal('__REMOTE_ACCESS__', { muxProxy: true, initialWindowMessages: 60, rpcCacheMs: 5000 })
+  defineGlobal('__DSH_TRANSPORT__', {
+    streamBaseUrl: 'https://smoke.trycloudflare.com/',
+    createWebSocket: (url) => {
+      const socket = new FakeSocket(url)
+      sockets.push(socket)
+      return socket
+    }
+  })
+
+  const createFace = () => captured.registration.factory(makeRequireShim(captured, moduleTable))
+  const fakeSlots = () => ({
+    inject(name, callback) {
+      return callback()
+    },
+    register() {
+      return () => {}
+    }
+  })
+  const chunk = (index, total, bytes) => Buffer.concat([Buffer.from(`DSHD1 ${index} ${total}\n`, 'ascii'), bytes])
+
+  const connection = {
+    openWebSocket() {
+      throw new Error('the original mux opener must be patched')
+    }
+  }
+  const face2 = createFace()
+  face2.apply({ connection, slots: fakeSlots() })
+  const socket = connection.openWebSocket('/api/remote.mux')
+  check(
+    'mux transport redirects through the deflate proxy',
+    sockets.length === 1 && sockets[0].url === 'wss://smoke.trycloudflare.com/remote-access/mux?deflate=1',
+    sockets[0]?.url
+  )
+
+  const muxSocket = sockets[0]
+  const messages = []
+  socket.addEventListener('message', (event) => messages.push(event.data))
+  const payload = `chunked-${'远程隧道数据'.repeat(200)}`
+  const compressed = deflateRawSync(Buffer.from(payload, 'utf8'))
+  const cut = Math.ceil(compressed.length / 3)
+  const parts = [compressed.subarray(0, cut), compressed.subarray(cut, cut * 2), compressed.subarray(cut * 2)]
+  muxSocket.emit('message', { data: chunk(0, 3, parts[0]) })
+  muxSocket.emit('message', { data: '{"interleaved":true}' })
+  muxSocket.emit('message', { data: chunk(1, 3, parts[1]) })
+  muxSocket.emit('message', { data: chunk(2, 3, parts[2]) })
+  await ticks()
+  check('a text frame interleaved with chunks still arrives', messages[0] === '{"interleaved":true}', JSON.stringify(messages.slice(0, 2)))
+  check('DSHD1 chunks inflate into one message', messages[1] === payload, `${messages[1]?.length} chars`)
+
+  // Two multi-chunk frames may interleave chunk by chunk.
+  const split = (buffer) => [buffer.subarray(0, 2), buffer.subarray(2)]
+  const [firstA, firstB] = split(deflateRawSync(Buffer.from('frame-first')))
+  const [secondA, secondB] = split(deflateRawSync(Buffer.from('frame-second')))
+  muxSocket.emit('message', { data: chunk(0, 2, firstA) })
+  muxSocket.emit('message', { data: chunk(0, 2, secondA) })
+  muxSocket.emit('message', { data: chunk(1, 2, firstB) })
+  muxSocket.emit('message', { data: chunk(1, 2, secondB) })
+  await ticks()
+  check('interleaved chunk groups finish in arrival order', messages[2] === 'frame-first' && messages[3] === 'frame-second', messages.slice(2, 4).join(','))
+
+  // total=1 still carries the header; a headerless frame is the old protocol.
+  muxSocket.emit('message', { data: chunk(0, 1, deflateRawSync(Buffer.from('single-chunk'))) })
+  muxSocket.emit('message', { data: deflateRawSync(Buffer.from('legacy-whole-frame')) })
+  await ticks()
+  check('a single-chunk DSHD1 frame inflates', messages[4] === 'single-chunk', messages[4])
+  check('a legacy headerless binary frame still inflates', messages[5] === 'legacy-whole-frame', messages[5])
+
+  // A malformed chunk header must fail the stream loudly instead of passing bytes through.
+  muxSocket.emit('message', { data: Buffer.from('DSHD1 nope\ndata', 'ascii') })
+  await ticks()
+  check('a malformed chunk header closes the mux with 1011', muxSocket.closed?.code === 1011, JSON.stringify(muxSocket.closed))
+  check('the decode failure is reported once', decodeErrors.filter((line) => line.includes('mux inflate failed')).length === 1, decodeErrors.join(' | '))
+
+  /* 8 — idempotent RPC cache */
+  const calls = []
+  const connection2 = {
+    rpc: {
+      async call(channel, endpoint, payload) {
+        calls.push({ channel, endpoint, payload })
+        return { ok: true, value: { endpoint, call: calls.length } }
+      }
+    }
+  }
+  face2.apply({ connection: connection2, slots: fakeSlots() })
+  const firstRead = await connection2.rpc.call('/api', 'skills/list', { args: [] })
+  const secondRead = await connection2.rpc.call('/api', 'skills/list', { args: [] })
+  check('an allowlisted read is served from cache', calls.length === 1 && secondRead === firstRead, `${calls.length} transport calls`)
+  await connection2.rpc.call('/api', 'skills/list', { args: ['other'] })
+  check('the cache key includes the payload', calls.length === 2, `${calls.length} transport calls`)
+  await connection2.rpc.call('/api', 'session/send', { args: ['x'] })
+  await connection2.rpc.call('/api', 'session/send', { args: ['x'] })
+  check('side-effecting calls are never cached', calls.length === 4, `${calls.length} transport calls`)
+  let aborted = false
+  try {
+    const signal = {
+      throwIfAborted() {
+        throw new Error('aborted')
+      }
+    }
+    await connection2.rpc.call('/api', 'skills/list', { args: [] }, signal)
+  } catch (error) {
+    aborted = true
+  }
+  check('a cache hit still honours the caller abort signal', aborted, 'no abort raised')
+  const before = calls.length
+  await connection2.rpc.call('/api', 'settings/describe', { args: [] })
+  await connection2.rpc.call('/api', 'settings/describe', { args: [] })
+  check('a second allowlisted endpoint is cached too', calls.length === before + 1, `${calls.length - before} transport calls`)
+  await connection2.rpc.call('/api', 'settings/update', { args: ['{}'] })
+  await connection2.rpc.call('/api', 'settings/describe', { args: [] })
+  check('a mutating call invalidates cached reads in its namespace', calls.length === before + 3, `${calls.length - before} transport calls`)
+  const realNow = Date.now
+  await connection2.rpc.call('/api', 'skills/list', { args: [] })
+  Date.now = () => realNow() + 6000
+  try {
+    await connection2.rpc.call('/api', 'skills/list', { args: [] })
+  } finally {
+    Date.now = realNow
+  }
+  check('a cached read expires after rpcCacheMs', calls.length === before + 5, `${calls.length - before} transport calls`)
+  await connection2.rpc.call('/api', 'skills/list', { args: [] })
+  check('an expired read is refreshed and cached again', calls.length === before + 5, `${calls.length - before} transport calls`)
+
+  /* 9 — rpcCacheMs: 0 turns the cache off */
+  const callsOff = []
+  const connection3 = {
+    rpc: {
+      async call(channel, endpoint, payload) {
+        callsOff.push({ channel, endpoint, payload })
+        return { ok: true, value: { endpoint } }
+      }
+    }
+  }
+  defineGlobal('__REMOTE_ACCESS__', { muxProxy: true, rpcCacheMs: 0 })
+  const face3 = createFace()
+  face3.apply({ connection: connection3, slots: fakeSlots() })
+  await connection3.rpc.call('/api', 'skills/list', { args: [] })
+  await connection3.rpc.call('/api', 'skills/list', { args: [] })
+  check('rpcCacheMs: 0 disables the cache', callsOff.length === 2, `${callsOff.length} transport calls`)
+
+  console.error = originalConsoleError
 
   process.stdout.write(`\n— panel text —\n${renderer.collectText(tree).join(' ').replace(/\s+/g, ' ').slice(0, 600)}\n`)
   return finish()

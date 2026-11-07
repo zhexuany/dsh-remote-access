@@ -107,6 +107,11 @@ async function main() {
     check('the initial window defaults to 60 messages', muxDefaults.initialWindowMessages === 60, String(muxDefaults.initialWindowMessages))
     check('initialWindowMessages: 0 keeps the upstream window', normalizeConfig({ initialWindowMessages: 0 }).initialWindowMessages === 0)
     check('the initial window never drops below 50', normalizeConfig({ initialWindowMessages: 10 }).initialWindowMessages === 50)
+    check('the replay stream strip is on by default', muxDefaults.stripStreamingReplay === true)
+    check('the downlink chunk defaults to 256 KiB', muxDefaults.muxChunkBytes === 262_144, String(muxDefaults.muxChunkBytes))
+    check('muxChunkBytes is clamped to 16 KiB..1 MiB', normalizeConfig({ muxChunkBytes: 1 }).muxChunkBytes === 16_384 && normalizeConfig({ muxChunkBytes: 9_000_000 }).muxChunkBytes === 1_048_576)
+    check('the RPC cache defaults to 30s', muxDefaults.rpcCacheMs === 30_000, String(muxDefaults.rpcCacheMs))
+    check('rpcCacheMs: 0 disables the client RPC cache', normalizeConfig({ rpcCacheMs: 0 }).rpcCacheMs === 0)
     check(
       'a Host answer counts as a healthy probe',
       [200, 303, 401, 403].every((code) => isHealthyTunnelStatus(code)),

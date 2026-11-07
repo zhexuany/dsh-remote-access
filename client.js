@@ -526,6 +526,47 @@ window.__ModuleLoader__.load({
       return Boolean(globalThis.__DSH_TRANSPORT__?.ownsHost)
     }
 
+    // Downlink framing: the Host may split one deflated frame into several
+    // binary frames. Each chunk carries an ASCII `DSHD1 <idx> <total>\n` header
+    // followed by a slice of the same `deflate-raw` stream; chunks of one frame
+    // arrive in order, but other frames (and text frames) may interleave. An
+    // older Host sends one headerless binary frame per payload, so that shape
+    // still inflates as a whole and stays compatible.
+    const CHUNK_HEADER_MAGIC = [0x44, 0x53, 0x48, 0x44, 0x31, 0x20] // "DSHD1 "
+    const CHUNK_HEADER_SCAN = 32
+    const MAX_PENDING_CHUNK_GROUPS = 8
+
+    /**
+     * Read the `DSHD1` header of one downlink binary frame.
+     * @param {Uint8Array} bytes - raw frame payload.
+     * @returns {null|false|{idx: number, total: number, start: number}} `null`
+     *   for a legacy headerless frame, `false` for a malformed chunk header,
+     *   otherwise the chunk index, total and data offset.
+     */
+    function parseChunkHeader(bytes) {
+      if (bytes.length <= CHUNK_HEADER_MAGIC.length) return null
+      for (let index = 0; index < CHUNK_HEADER_MAGIC.length; index += 1) {
+        if (bytes[index] !== CHUNK_HEADER_MAGIC[index]) return null
+      }
+      const scan = Math.min(bytes.length - 1, CHUNK_HEADER_SCAN)
+      let end = -1
+      for (let index = CHUNK_HEADER_MAGIC.length; index <= scan; index += 1) {
+        if (bytes[index] === 0x0a) {
+          end = index
+          break
+        }
+      }
+      if (end < 0) return false
+      let header = ''
+      for (let index = 0; index < end; index += 1) header += String.fromCharCode(bytes[index])
+      const match = /^DSHD1 ([0-9]{1,7}) ([0-9]{1,7})$/.exec(header)
+      if (!match) return false
+      const idx = Number(match[1])
+      const total = Number(match[2])
+      if (total < 1 || total > 1_000_000 || idx >= total) return false
+      return { idx, total, start: end + 1 }
+    }
+
     function inflateSocket(inner) {
       const listeners = new Map()
       const emit = (type, event) => {
@@ -584,6 +625,40 @@ window.__ModuleLoader__.load({
         if (typeof Blob !== 'undefined' && data instanceof Blob) return new Uint8Array(await data.arrayBuffer())
         throw new Error('remote-access: unexpected mux frame type')
       }
+      // Unfinished DSHD1 groups. Chunks of one frame arrive in order, but a
+      // text frame or a chunk of another frame can be interleaved, so more than
+      // one group may be open; each new frame starts at idx 0.
+      const pendingChunks = []
+      const acceptChunk = async (bytes, header) => {
+        let group = null
+        if (header.idx > 0) {
+          for (let index = pendingChunks.length - 1; index >= 0; index -= 1) {
+            const candidate = pendingChunks[index]
+            if (candidate.total === header.total && candidate.next === header.idx) {
+              group = candidate
+              break
+            }
+          }
+          if (!group) throw new Error(`remote-access: mux chunk ${header.idx}/${header.total} arrived without its predecessors`)
+        } else {
+          group = { total: header.total, next: 0, chunks: [] }
+          pendingChunks.push(group)
+          if (pendingChunks.length > MAX_PENDING_CHUNK_GROUPS) throw new Error('remote-access: mux chunk groups are not completing')
+        }
+        group.chunks.push(bytes.subarray(header.start))
+        group.next += 1
+        if (group.next < group.total) return
+        pendingChunks.splice(pendingChunks.indexOf(group), 1)
+        let length = 0
+        for (const chunk of group.chunks) length += chunk.length
+        const merged = new Uint8Array(length)
+        let offset = 0
+        for (const chunk of group.chunks) {
+          merged.set(chunk, offset)
+          offset += chunk.length
+        }
+        await emitMessage(await inflateBytes(merged))
+      }
       inner.addEventListener('open', () => emit('open', { type: 'open', target }))
       inner.addEventListener('close', (event) => emit('close', { type: 'close', code: event.code, reason: event.reason, wasClean: event.wasClean, target }))
       inner.addEventListener('error', (event) => emit('error', { type: 'error', error: event.error ?? event, target }))
@@ -594,7 +669,16 @@ window.__ModuleLoader__.load({
           return
         }
         chain = chain
-          .then(async () => emitMessage(await inflateBytes(await toBytes(data))))
+          .then(async () => {
+            const bytes = await toBytes(data)
+            const header = parseChunkHeader(bytes)
+            if (header === null) {
+              await emitMessage(await inflateBytes(bytes))
+              return
+            }
+            if (!header) throw new Error('remote-access: malformed DSHD1 mux chunk header')
+            await acceptChunk(bytes, header)
+          })
           .catch((error) => {
             console.error('[remote-access] mux inflate failed', error)
             try {
@@ -633,6 +717,94 @@ window.__ModuleLoader__.load({
       connection.__remoteAccessPatched = true
     }
 
+    // Read-only RPC responses that the settings/session UI re-requests as the
+    // user opens panels and switches sessions. Only these idempotent endpoints
+    // are cached; anything that can have a side effect is never cached and, when
+    // it succeeds, clears the cached reads it may have made stale.
+    const RPC_CACHE_ENDPOINTS = new Set([
+      'skills/list',
+      'commands/list',
+      'agentPresets/list',
+      'settings/describe',
+      'session/modelCatalog', // wire endpoint of the typert `modelCatalog` method
+      'llm/listProviders'
+    ])
+    const RPC_CACHE_MAX_ENTRIES = 200
+    const RPC_CACHE_INVALIDATION = {
+      settings: ['settings/', 'llm/', 'session/', 'agentPresets/', 'skills/', 'commands/'],
+      llm: ['llm/', 'session/'],
+      agentPresets: ['agentPresets/'],
+      skills: ['skills/'],
+      commands: ['commands/'],
+      // Routine session RPCs (send/list/fork…) do not change the model catalog;
+      // settings and provider changes above are what invalidate it.
+      session: []
+    }
+
+    function rpcCacheTtl() {
+      const configured = remoteConfig?.rpcCacheMs
+      if (configured === undefined || configured === null) return 30000
+      const ttl = Number(configured)
+      if (!Number.isFinite(ttl)) return 30000
+      return ttl <= 0 ? 0 : Math.floor(ttl)
+    }
+
+    function installRpcCache(ctx) {
+      const ttl = rpcCacheTtl()
+      if (ttl <= 0) return
+      const connection = ctx.connection
+      const rpc = connection?.rpc
+      if (!rpc || typeof rpc.call !== 'function' || connection.__remoteAccessRpcPatched) return
+      const entries = new Map()
+      const namespaceOf = (endpoint) => {
+        const slash = endpoint.indexOf('/')
+        return slash < 0 ? endpoint : endpoint.slice(0, slash)
+      }
+      const invalidate = (endpoint) => {
+        const prefixes = RPC_CACHE_INVALIDATION[namespaceOf(endpoint)] ?? [`${namespaceOf(endpoint)}/`]
+        for (const [key, entry] of entries) {
+          if (prefixes.some((prefix) => entry.endpoint.startsWith(prefix))) entries.delete(key)
+        }
+      }
+      const keyFor = (channel, endpoint, payload) => {
+        if (!RPC_CACHE_ENDPOINTS.has(endpoint)) return null
+        try {
+          return `${channel}\n${endpoint}\n${JSON.stringify(payload)}`
+        } catch (error) {
+          // A payload we cannot fingerprint (cycles, BigInt) is not cacheable.
+          return null
+        }
+      }
+      const originalCall = rpc.call.bind(rpc)
+      rpc.call = async function callWithCache(channel, endpoint, payload, signal) {
+        const key = keyFor(channel, endpoint, payload)
+        if (key !== null) {
+          const hit = entries.get(key)
+          if (hit) {
+            if (hit.expires > Date.now()) {
+              signal?.throwIfAborted?.()
+              return hit.value
+            }
+            entries.delete(key)
+          }
+        }
+        const result = await originalCall(channel, endpoint, payload, signal)
+        if (key !== null) {
+          if (result?.ok === true) {
+            if (entries.size >= RPC_CACHE_MAX_ENTRIES) {
+              const oldest = entries.keys().next()
+              if (!oldest.done) entries.delete(oldest.value)
+            }
+            entries.set(key, { expires: Date.now() + ttl, endpoint, value: result })
+          }
+          return result
+        }
+        if (typeof endpoint === 'string' && result?.ok !== false) invalidate(endpoint)
+        return result
+      }
+      connection.__remoteAccessRpcPatched = true
+    }
+
     function installWindowPatch() {
       const limit = Number(remoteConfig?.initialWindowMessages)
       if (!Number.isFinite(limit) || limit <= 0) return
@@ -668,6 +840,11 @@ window.__ModuleLoader__.load({
           installMuxTransport(ctx)
         } catch (error) {
           console.warn('[remote-access] mux transport patch failed', error)
+        }
+        try {
+          installRpcCache(ctx)
+        } catch (error) {
+          console.warn('[remote-access] rpc cache patch failed', error)
         }
         try {
           installWindowPatch()

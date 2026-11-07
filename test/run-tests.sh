@@ -56,6 +56,14 @@ echo "== websocket primitives unit (handshake + frame codec) =="
 run "$ROOT/test/ws-unit.mjs"
 
 echo
+echo "== stream strip unit (history replay optimisation) =="
+run "$ROOT/test/stream-strip-unit.mjs"
+
+echo
+echo "== mux chunk unit (DSHD1 downlink framing) =="
+run "$ROOT/test/mux-chunk-unit.mjs"
+
+echo
 echo "== mux proxy unit (compressed tunnel transport) =="
 run "$ROOT/test/mux-proxy-unit.mjs"
 

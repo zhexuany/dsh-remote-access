@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Downlink mux frames now carry a much smaller payload: the Host neutralises replayed
+  `assistant/message.data.stream` events (≈48% of a real window; `data.stream` becomes `[]`, because client
+  trace folding iterates it), deflates the result, and splits it into bounded `DSHD1 <idx> <total>` chunks
+  (`muxChunkBytes`, default 256 KiB). A 2.6 MB sample frame goes 2.6 MB → 1.3 MB after stripping → 266 KB on
+  the wire (≈90% smaller), and the client reassembles chunks before one `DecompressionStream` inflate, so a
+  single giant frame no longer stalls the tunnel. `stripStreamingReplay` (true) and `muxChunkBytes` are new
+  knobs; chunk reassembly is verified end-to-end through a quick tunnel.
+- The client half memoises read-only startup RPCs (`skills/list`, `commands/list`, `agentPresets/list`,
+  `settings/describe`, `session/modelCatalog`, `llm/listProviders`) behind `rpcCacheMs` (default 30s, `0`
+  disables), keyed by channel + endpoint + payload and invalidated by namespace, so a switch no longer pays
+  5–6 serial HTTP round trips. Keep-warm session retention was evaluated and rejected: releasing the main
+  view tears down its scope/event stream and holding an extra reference leaks Host activation and unbounded
+  windows (design note in the development notes).
 - Conversation switches over a tunnel no longer ship the whole history window as plain JSON. Cloudflare's
   edge strips `Sec-WebSocket-Extensions` from the gateway's `101`, so the origin's permessage-deflate never
   negotiates (4× left on the table). The Host now registers an upgrade route `/remote-access/mux`; the web

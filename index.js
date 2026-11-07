@@ -135,7 +135,10 @@ function installClientConfig(ctx, config, logger, muxProxy) {
   if (typeof webServer?.tapIndex !== 'function') return
   const payload = JSON.stringify({
     muxProxy,
-    initialWindowMessages: config.initialWindowMessages
+    initialWindowMessages: config.initialWindowMessages,
+    stripStreamingReplay: config.stripStreamingReplay,
+    muxChunkBytes: config.muxChunkBytes,
+    rpcCacheMs: config.rpcCacheMs
   }).replaceAll('<', '\\u003c')
   const tag = `<script>window.__REMOTE_ACCESS__=${payload}</script>`
   try {
