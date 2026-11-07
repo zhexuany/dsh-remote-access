@@ -52,6 +52,14 @@ echo "== installer unit (profile manifest + managed mux heartbeat block) =="
 run "$ROOT/test/installer-unit.mjs"
 
 echo
+echo "== websocket primitives unit (handshake + frame codec) =="
+run "$ROOT/test/ws-unit.mjs"
+
+echo
+echo "== mux proxy unit (compressed tunnel transport) =="
+run "$ROOT/test/mux-proxy-unit.mjs"
+
+echo
 echo "== client panel smoke =="
 if [ -n "$1" ]; then
   if [ -n "$2" ]; then

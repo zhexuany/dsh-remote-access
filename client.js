@@ -490,10 +490,190 @@ window.__ModuleLoader__.load({
       )
     }
 
+
+    // ── tunnel transport tuning ─────────────────────────────────────────────
+    // A conversation switch over the tunnel has two avoidable costs:
+    //   1. the initial history window arrives as ONE WebSocket frame, and the
+    //      CDN edge strips `Sec-WebSocket-Extensions`, so the gateway's
+    //      permessage-deflate never negotiates — the window crosses the wire
+    //      as plain JSON;
+    //   2. that window is up to 500 messages even when only the last screenful
+    //      is looked at.
+    // The Host half serves `/remote-access/mux`, which deflates large downlink
+    // frames; this half asks for that route, inflates the frames back to text,
+    // and narrows the requested window. Both are best-effort: any failure falls
+    // back to the direct gateway path and the upstream window size.
+    const MUX_PATH = '/api/remote.mux'
+    const MUX_PROXY_PATH = '/remote-access/mux?deflate=1'
+    const remoteConfig =
+      globalThis.__REMOTE_ACCESS__ && typeof globalThis.__REMOTE_ACCESS__ === 'object'
+        ? globalThis.__REMOTE_ACCESS__
+        : null
+
+    function isLoopbackBrowser() {
+      const host = String(globalThis.location?.hostname || '')
+      if (
+        host === '' ||
+        host === 'localhost' ||
+        host === '127.0.0.1' ||
+        host === '::1' ||
+        host === '[::1]' ||
+        host.endsWith('.localhost')
+      ) {
+        return true
+      }
+      // The desktop shell talks to its own Host directly: no tunnel, no benefit.
+      return Boolean(globalThis.__DSH_TRANSPORT__?.ownsHost)
+    }
+
+    function inflateSocket(inner) {
+      const listeners = new Map()
+      const emit = (type, event) => {
+        const set = listeners.get(type)
+        if (set) {
+          for (const handler of [...set]) {
+            try {
+              handler.call(target, event)
+            } catch (error) {
+              console.error('[remote-access] mux listener failed', error)
+            }
+          }
+        }
+        const property = target[`on${type}`]
+        if (typeof property === 'function') {
+          try {
+            property.call(target, event)
+          } catch (error) {
+            console.error('[remote-access] mux listener failed', error)
+          }
+        }
+      }
+      const emitMessage = (text) => emit('message', { type: 'message', data: text, target })
+      let chain = Promise.resolve()
+      const target = {
+        get readyState() {
+          return inner.readyState
+        },
+        send(data) {
+          try {
+            inner.send(data)
+          } catch (error) {
+            // A closed socket is the mux client's business, not ours.
+          }
+        },
+        close(code, reason) {
+          try {
+            inner.close(code, reason)
+          } catch (error) {
+            // already closed
+          }
+        },
+        addEventListener(type, handler) {
+          if (typeof handler !== 'function') return
+          let set = listeners.get(type)
+          if (!set) listeners.set(type, (set = new Set()))
+          set.add(handler)
+        },
+        removeEventListener(type, handler) {
+          listeners.get(type)?.delete(handler)
+        }
+      }
+      const toBytes = async (data) => {
+        if (data instanceof ArrayBuffer) return new Uint8Array(data)
+        if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        if (typeof Blob !== 'undefined' && data instanceof Blob) return new Uint8Array(await data.arrayBuffer())
+        throw new Error('remote-access: unexpected mux frame type')
+      }
+      inner.addEventListener('open', () => emit('open', { type: 'open', target }))
+      inner.addEventListener('close', (event) => emit('close', { type: 'close', code: event.code, reason: event.reason, wasClean: event.wasClean, target }))
+      inner.addEventListener('error', (event) => emit('error', { type: 'error', error: event.error ?? event, target }))
+      inner.addEventListener('message', (event) => {
+        const data = event.data
+        if (typeof data === 'string') {
+          chain = chain.then(() => emitMessage(data)).catch((error) => console.error('[remote-access] mux frame failed', error))
+          return
+        }
+        chain = chain
+          .then(async () => emitMessage(await inflateBytes(await toBytes(data))))
+          .catch((error) => {
+            console.error('[remote-access] mux inflate failed', error)
+            try {
+              inner.close(1011, 'inflate failed')
+            } catch {
+              // already closed
+            }
+          })
+      })
+      return target
+    }
+
+    async function inflateBytes(bytes) {
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'))
+      return await new Response(stream).text()
+    }
+
+    function installMuxTransport(ctx) {
+      if (!remoteConfig?.muxProxy) return
+      if (typeof DecompressionStream !== 'function' || typeof Blob !== 'function') return
+      if (isLoopbackBrowser()) return
+      const connection = ctx.connection
+      if (!connection || typeof connection.openWebSocket !== 'function' || connection.__remoteAccessPatched) return
+      const transport = globalThis.__DSH_TRANSPORT__
+      const original = connection.openWebSocket.bind(connection)
+      connection.openWebSocket = (path) => {
+        if (path !== MUX_PATH) return original(path)
+        const base = transport?.streamBaseUrl ?? document.baseURI
+        const url = new URL(MUX_PROXY_PATH, base)
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+        const socket = typeof transport?.createWebSocket === 'function'
+          ? transport.createWebSocket(url.href)
+          : new WebSocket(url.href)
+        return inflateSocket(socket)
+      }
+      connection.__remoteAccessPatched = true
+    }
+
+    function installWindowPatch() {
+      const limit = Number(remoteConfig?.initialWindowMessages)
+      if (!Number.isFinite(limit) || limit <= 0) return
+      let module
+      try {
+        module = require('@deepseek-ai/dsh-api-session-controller/client')
+      } catch (error) {
+        return
+      }
+      const Stream = module?.SessionEventStream ?? module?.default?.SessionEventStream
+      if (typeof Stream !== 'function') return
+      // `open` lives on the shared RemoteJournalStream base; wrapping it caps the
+      // initial follow window (and each loadOlder page) without touching the
+      // controller itself. Other journal consumers passing maxMessages also get
+      // the smaller page, which is the same trade they already accept.
+      const proto = Object.getPrototypeOf(Stream.prototype)
+      if (!proto || typeof proto.open !== 'function' || proto.__remoteAccessWindowPatched) return
+      const originalOpen = proto.open
+      proto.open = function openWithSmallWindow(options) {
+        if (options && typeof options === 'object' && Number(options.maxMessages) > limit) {
+          options = { ...options, maxMessages: limit }
+        }
+        return originalOpen.call(this, options)
+      }
+      proto.__remoteAccessWindowPatched = true
+    }
+
     return {
       name: 'dsh-remote-access',
-      inject: ['slots'],
+      inject: ['slots', 'connection'],
       apply(ctx) {
+        try {
+          installMuxTransport(ctx)
+        } catch (error) {
+          console.warn('[remote-access] mux transport patch failed', error)
+        }
+        try {
+          installWindowPatch()
+        } catch (error) {
+          console.warn('[remote-access] window patch failed', error)
+        }
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {

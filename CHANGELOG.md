@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Conversation switches over a tunnel no longer ship the whole history window as plain JSON. Cloudflare's
+  edge strips `Sec-WebSocket-Extensions` from the gateway's `101`, so the origin's permessage-deflate never
+  negotiates (4× left on the table). The Host now registers an upgrade route `/remote-access/mux`; the web
+  client reroutes its mux socket there with `?deflate=1`, the proxy authenticates upstream with the browser's
+  cookie, and downlink text frames at or above `muxCompressionThresholdBytes` (default 1 KB) are sent as
+  deflate-raw binary frames that the browser inflates with `DecompressionStream`. Loopback access and browsers
+  without `DecompressionStream` keep the direct path; failures fall back to it. Measured on a 700 KB/s,
+  80 ms link: a 1.1 MB window became ~0.22 MB and the slowest sampled switch went from 4.0s to 1.8s.
+- The client half also narrows the initial history window: `follow`/`loadOlder` request
+  `initialWindowMessages` (default 60) instead of the controller's 500, so a switch pays for the last
+  screenful rather than the whole session. Older history is fetched page by page on scroll-up. Set it to `0`
+  to keep DSH's own window, or pair `muxCompression: false` with it if only one of the two changes is wanted.
+- `status` gained a `mux` counter block (`connections`, `downlinkRawBytes`, `compressedBytes`,
+  `compressedFrames`, `recentFrames`, …) plus `muxCompression` and `initialWindowMessages`, so the panel, CLI
+  and tests can tell whether compression actually engaged.
+- New transport knobs: `muxCompression` (true), `muxCompressionLevel` (4, 1–9),
+  `muxCompressionThresholdBytes` (1024), `muxHandshakeTimeoutMs` (8000). The proxy and a dependency-free
+  RFC 6455 codec live in `lib/mux-proxy.js` / `lib/ws.js`; both have offline unit tests (`ws-unit`,
+  `mux-proxy-unit`) wired into `test/run-tests.sh`.
 - Added a public-URL watchdog. A dead edge connection — typically a quick tunnel whose server-side record is
   gone (`Unauthorized: Tunnel not found`) — makes cloudflared retry forever without exiting, so the supervisor
   used to keep reporting `ready` while the share link answered 502/530/1033. It now probes the public URL every

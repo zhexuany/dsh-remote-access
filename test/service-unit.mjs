@@ -98,6 +98,15 @@ async function main() {
     )
     check('healthCheckMs: 0 turns the watchdog off', normalizeConfig({ healthCheckMs: 0 }).healthCheckMs === 0, String(normalizeConfig({ healthCheckMs: 0 }).healthCheckMs))
     check('the watchdog interval has a floor', normalizeConfig({ healthCheckMs: 1000 }).healthCheckMs === 5_000, String(normalizeConfig({ healthCheckMs: 1000 }).healthCheckMs))
+    const muxDefaults = normalizeConfig({})
+    check('mux compression is on by default', muxDefaults.muxCompression === true)
+    check('mux compression level defaults to 4', muxDefaults.muxCompressionLevel === 4, String(muxDefaults.muxCompressionLevel))
+    check('frames below 1KB stay uncompressed', muxDefaults.muxCompressionThresholdBytes === 1_024)
+    check('mux compression can be disabled', normalizeConfig({ muxCompression: false }).muxCompression === false)
+    check('compression level is clamped to 1..9', normalizeConfig({ muxCompressionLevel: 99 }).muxCompressionLevel === 9)
+    check('the initial window defaults to 60 messages', muxDefaults.initialWindowMessages === 60, String(muxDefaults.initialWindowMessages))
+    check('initialWindowMessages: 0 keeps the upstream window', normalizeConfig({ initialWindowMessages: 0 }).initialWindowMessages === 0)
+    check('the initial window never drops below 50', normalizeConfig({ initialWindowMessages: 10 }).initialWindowMessages === 50)
     check(
       'a Host answer counts as a healthy probe',
       [200, 303, 401, 403].every((code) => isHealthyTunnelStatus(code)),

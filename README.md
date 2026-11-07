@@ -25,11 +25,12 @@
 - [6. 使用](#6-使用)
 - [7. 配置](#7-配置)
 - [8. 连接稳定性](#8-连接稳定性)
-- [9. 运行时文件](#9-运行时文件)
-- [10. 排错](#10-排错)
-- [11. 已知限制](#11-已知限制)
-- [12. 开发与测试](#12-开发与测试)
-- [13. 许可证](#13-许可证)
+- [9. 会话切换速度](#9-会话切换速度)
+- [10. 运行时文件](#10-运行时文件)
+- [11. 排错](#11-排错)
+- [12. 已知限制](#12-已知限制)
+- [13. 开发与测试](#13-开发与测试)
+- [14. 许可证](#14-许可证)
 
 ## 1. 它解决什么问题
 
@@ -280,6 +281,11 @@ SSH 里，不经过 Cloudflare。
 | `healthCheckTimeoutMs` | `8000` | 单次健康检查的超时 |
 | `healthFailures` | `3` | 连续失败多少次后重启 cloudflared（quick 隧道会换新地址与链接） |
 | `healthDnsGraceMs` | `120000` | 新 quick 域名刚生成时 DNS 可能还没生效；这段时间的解析失败（`ENOTFOUND`/`EAI_AGAIN`）不计入失败 |
+| `muxCompression` | `true` | 经隧道时压缩会话历史的大 WebSocket 下行帧（§9）；回环直连时自动不启用 |
+| `muxCompressionLevel` | `4` | zlib 压缩级别 1–9；越大越省带宽、越费 CPU |
+| `muxCompressionThresholdBytes` | `1024` | 小于该字节数的下行帧不压缩（128–1048576） |
+| `muxHandshakeTimeoutMs` | `8000` | 压缩代理连本机 mux 的握手超时 |
+| `initialWindowMessages` | `60` | 首次打开会话请求的消息上限（DSH 默认 500）；`0` 表示不改，翻历史按页加载 |
 | `tunnelLogLevel` | `info` | 传给 cloudflared 的 `--loglevel`（`debug` 能看清边缘连接细节） |
 | `tunnelLogBytes` | `1000000` | 日志超过这个字节数就滚成 `tunnel.log.1` |
 | `home` | 自动探测 | 强制指定 `DSH_HOME` |
@@ -315,7 +321,34 @@ Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel n
    cloudflared 并重新拉起——quick 隧道会生成新地址、写一份新链接。新域名刚生成时 DNS 可能还没生效，这段时间的
    解析失败不算失败（`healthDnsGraceMs`，默认 120s），否则换了新域名反而会被自己误杀。`healthCheckMs: 0` 可以关掉它。
 
-## 9. 运行时文件
+## 9. 会话切换速度
+
+点侧边栏切换对话时，浏览器先拿到该会话的「初始历史窗口」：一次 `follow` 往返之后，整个窗口作为一条
+WebSocket 文本帧到达。DSH 默认最多 500 条消息；大会话里这条帧实测 1–11 MB。
+
+两个放大因素：
+
+1. 网关本身支持 `permessage-deflate`（直连时 101 会协商，实测约 4×），但 Cloudflare 边缘不在 101 响应里
+   回显 `Sec-WebSocket-Extensions`，扩展协商被静默丢弃——窗口以未压缩 JSON 过隧道；
+2. 隧道有效上行带宽实测约 0.65–0.8 MB/s，1 MB 窗口约 1.3–1.6s，10 MB 量级要十几秒。
+
+插件为此加了两件事（默认都开，可分别关闭）：
+
+1. **mux 压缩代理**：Host 新增 upgrade 路由 `/remote-access/mux`。浏览器插件把发往 `/api/remote.mux`
+   的连接改道到这里（带 `?deflate=1`），代理经回环连真正的 mux（转发同一个 Cookie，鉴权仍由网关完成），
+   把达到 `muxCompressionThresholdBytes` 的下行文本帧用 deflate-raw 压成二进制帧，浏览器侧用
+   `DecompressionStream('deflate-raw')` 还原。小帧、上行帧原样转发；本地直连或不支持
+   `DecompressionStream` 的浏览器自动走原路径。实测一条 1.1 MB 窗口压到约 0.22 MB（约 5×）。
+2. **缩小初始窗口**：客户端把 `follow` / `loadOlder` 的 `maxMessages` 压到 `initialWindowMessages`
+   （默认 60）。往前翻历史时按页补拉，每次多一个往返；想少翻页可以把它调大。
+
+在 700 KB/s + 80 ms 的模拟链路上，同一会话的首个窗口从 2.8s 降到 2.2s，另一个会话从 3.3s 降到 1.1s
+（大会话的首帧时间还受 Host 冷读 zstd 文件影响，所以收益不是线性的）。`status` 里的 `mux` 块给出
+`downlinkRawBytes` / `compressedBytes` / `compressedFrames` 等计数，可以确认压缩是否在生效。
+
+这两个补丁都在浏览器侧落地：更新 Host 代码后需要重启一次 Desktop，并硬刷新浏览器页面。
+
+## 10. 运行时文件
 
 ```
 <DSH_HOME>/remote-access/          # 目录权限 0700
@@ -328,7 +361,7 @@ Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel n
 
 `state.json` 记住上次是运行还是停止，Desktop 重启后由 `autoStart` 与它共同决定是否恢复隧道。
 
-## 10. 排错
+## 11. 排错
 
 | 现象 | 处理 |
 |------|------|
@@ -342,7 +375,7 @@ Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel n
 | `ssh -L` 打开却 401 | 本机链接按 `host:port` 签发，换端口后重新复制一次 |
 | 改了源码但界面没变化 | 面板改动刷新页面即可；Host 侧改动必须重启 Desktop，因为 Host 不会重载已 import 的模块 |
 
-## 11. 已知限制
+## 12. 已知限制
 
 - 目标只能是本机回环上的 DSH Host（不做「转发到另一台机器」）。
 - 主要验证平台是 macOS。Windows 上核心逻辑（隧道、围栏、面板）是纯 Node，可以运行；但 `bin/dsh-remote-access`
@@ -356,7 +389,7 @@ Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel n
   视觉细节不会与 Desktop 自带设置页完全一致。
 - 「重新连接中」只能被降低概率，不能被消灭（§8）。
 
-## 12. 开发与测试
+## 13. 开发与测试
 
 ```sh
 ./test/run-tests.sh   # 离线测试：service-unit + installer-unit + client-smoke
@@ -374,7 +407,7 @@ CI（`.github/workflows/ci.yml`）在 `macos-latest` + Node 22 上跑语法检�
 
 欢迎 issue 与 PR；提交信息使用 Conventional Commits。
 
-## 13. 许可证
+## 14. 许可证
 
 Apache License 2.0，全文见 [LICENSE](LICENSE)。著作权与归属见 [NOTICE](NOTICE)：
 
@@ -408,6 +441,13 @@ supervisor also polls the public URL itself (`healthCheckMs`, 15s) and restarts 
 `healthFailures` (3) consecutive misses, because a dead edge connection — a quick tunnel whose record is gone,
 for instance — retries forever without exiting and would otherwise leave a "ready" panel behind a URL that
 answers 502/530/1033. These measures reduce, but cannot eliminate, transient reconnects on a public tunnel.
+
+Switching conversations is the other slow path: the initial history window (up to 500 messages, 1–11 MB in
+large sessions) arrives as one uncompressed WebSocket frame, because Cloudflare's edge drops the gateway's
+`permessage-deflate` offer. The Host therefore serves a sibling mux route (`/remote-access/mux`) that deflates
+large downlink frames (≈5× on a 1.1 MB window), and the client half narrows the initial window to
+`initialWindowMessages` (default 60) and inflates frames with `DecompressionStream`. Both are best-effort and
+fall back to the direct gateway path; see README §9 for numbers and configuration.
 
 The plugin is developed and validated on macOS. The tunnel service, the trusted-host fence and the settings
 panel are plain Node/DOM code, so a Windows host works too once the plugin is installed with `dsh plugin add`

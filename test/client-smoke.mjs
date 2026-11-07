@@ -283,7 +283,7 @@ async function main() {
   check('registration id is the package name', captured.registration.id === 'dsh-remote-access', captured.registration.id)
   check('require() asked only for react', captured.requires.every((spec) => spec === 'react'), captured.requires.join(', '))
   check('exports a cordis face (apply)', typeof face?.apply === 'function')
-  check('injects only "slots"', JSON.stringify(face?.inject) === '["slots"]', JSON.stringify(face?.inject))
+  check('injects "slots" and "connection"', JSON.stringify(face?.inject) === '["slots","connection"]', JSON.stringify(face?.inject))
 
   /* 3 — apply to a fake cordis context */
   let registered = null
