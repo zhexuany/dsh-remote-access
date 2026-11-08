@@ -178,7 +178,7 @@ cd dsh-remote-access
 --profile <name>        profile 名（默认 desktop）
 --copy | --link         复制快照（默认）或软链（改代码即生效，适合开发）
 --no-cloudflared        不放置 cloudflared（用 PATH 里或 Homebrew 的）
---heartbeat-ms <ms>     写进 profile 补丁的心跳间隔（默认 15000）
+--heartbeat-ms <ms>     写进 profile 补丁的心跳间隔（默认 30000）
 --no-heartbeat          不写（或删除）那段受管心跳覆盖
 --uninstall             卸载（只回收自己写入的依赖、软链与心跳覆盖）
 --dry-run / --json
@@ -291,6 +291,9 @@ SSH 里，不经过 Cloudflare。
 | `muxChunkBytes` | `262144` | 压缩后的帧再切成多大的 `DSHD1` 分块（16 KiB–1 MiB）；避免单条巨帧卡住隧道 |
 | `rpcCacheMs` | `30000` | 切换会话时只读 RPC（skills/commands/agentPresets 等 6 个）的客户端缓存 TTL；`0` = 关闭 |
 | `remoteDirectoryPicker` | `true` | 远端页面用插件自绘的目录浏览对话框代替会阻塞的 macOS 原生面板（§10）；本机回环始终用原生面板 |
+| `edgeIpVersion` | `auto` | 仅 cloudflared 通道：传给 `--edge-ip-version`；本机 IPv6 路由不通时设 `4`，省掉每次尝试的 AAAA 超时 |
+| `tunnelRetries` | `5` | 仅 cloudflared 通道：连接/协议错误的 `--retries` 预算（1–20），越高越能扛住边缘连接抖动 |
+| `wsDiagnostics` | `true` | 远端页面把每条页面 WebSocket 的生命周期（路径、开启/关闭时间、close code、帧数）上报给 Host，最近 20 条见 `status.wsRecent`；本机回环页面不上报 |
 | `tunnelLogLevel` | `info` | 传给 cloudflared 的 `--loglevel`（`debug` 能看清边缘连接细节） |
 | `tunnelLogBytes` | `1000000` | 日志超过这个字节数就滚成 `tunnel.log.1` |
 | `home` | 自动探测 | 强制指定 `DSH_HOME` |
@@ -304,24 +307,31 @@ SSH 里，不经过 Cloudflare。
 闪断不会丢任务。
 
 公网路径上「pong 迟到」比「链路断开」更常见：浏览器标签页被节流、网络切换、边缘连接被回收，都可能连续
-错过两次心跳。插件为此先做了四件事（前两项需要**重启一次 Desktop** 才生效）：
+错过两次心跳。插件为此做了五件事（第 1 项要**重启一次 Desktop** 才生效；第 5 项只做归因，不改变行为）：
 
 1. **放宽心跳**：安装器往 profile 补丁写一段受管的 `typert-gateway` 覆盖，把 `websocketHeartbeatIntervalMs`
-   从 2000 调到 15000——要连丢两次包得跨 30 秒才致命；
+   从 2000 调到 30000——要连丢两次包得跨 60–90 秒才致命，锁屏或短暂丢包不再被立刻判死。已经装过老版本的
+   profile 不会自己变：重跑一次 `bin/install.mjs`（它会把受管块从 15000 改写成 30000）。注意它**救不了换网**：
+   切换 Wi-Fi/蜂窝会换掉 TCP 四元组，旧 socket 必死；
 2. **让代理连接先过期**：cloudflared 默认把 origin 连接保留约 90s，而 Node 的 keep-alive 是 65s；插件默认传
    `--proxy-keepalive-timeout 60s`，避免复用已被回收的连接；
 3. **抬高 origin keep-alive**：把 `webServer.server.keepAliveTimeout` 抬到 `keepAliveMs`（默认 65s），并把
    `headersTimeout` 提到至少 70s；
 4. **日志落盘**：cloudflared 输出与插件日志都追加进 `tunnel.log` 并按大小滚动，边缘连接有没有在重连才有
-   证据可查，而不是只有一个内存环。
+   证据可查，而不是只有一个内存环；
+5. **区分谁断的**：mux 代理在 `status.mux.closedBy` 里按 `browser` / `upstream` / `failure` / `dispose`
+   计数（`dispose` = 插件卸载时还在的 socket），并在 `lastClose` 里记下第一个决定关闭的调用方与 WebSocket
+   close code；远端页面还会把**所有**页面 WebSocket 的关闭信息（路径、存活时长、close code、帧数、是否在关前
+   收到消息）上报上来，最近 20 条在 `status.wsRecent`。mux 的计数器看不见侧边栏那条 `/sidebar/ws/agent-opens`，
+   而那正是 `重新连接中` 之前最常掉的一条——两个字段一起看，才知道是谁断的。
 
 这些手段只能降低「重新连接中」的概率，不能消除：公网隧道本身会抖。
 
 还有一类故障不走「重新连接中」：cloudflared 的进程不退出，但它和边缘的连接已经作废——典型是 quick 隧道在
 Cloudflare 侧的记录被回收，日志里反复出现 `Unauthorized: Tunnel not found`。这时面板仍显示「已就绪」，链接
-却只会返回 502/530/1033。插件为此再做了第五件事：
+却只会返回 502/530/1033。插件为此再补了一个看门狗：
 
-5. **公网 URL 看门狗**：隧道就绪后每 `healthCheckMs`（默认 15s）请求一次公网地址，不带令牌；只有拿到 Host
+- **公网 URL 看门狗**：隧道就绪后每 `healthCheckMs`（默认 15s）请求一次公网地址，不带令牌；只有拿到 Host
    的应答（401 是健康答案，200/303/403 也算通）才记为健康。连续 `healthFailures`（默认 3）次失败就杀掉
    cloudflared 并重新拉起——quick 隧道会生成新地址、写一份新链接。新域名刚生成时 DNS 可能还没生效，这段时间的
    解析失败不算失败（`healthDnsGraceMs`，默认 120s），否则换了新域名反而会被自己误杀。`healthCheckMs: 0` 可以关掉它。
@@ -473,9 +483,9 @@ cookie bound to the tunnel hostname, valid for 30 days). The plugin never offers
 either layer, and its own `/remote-access/*` endpoints are authenticated the same way. A share link is
 equivalent to full control of the host machine — treat it as a secret, and stop the tunnel when done.
 
-Because the GUI talks to the Host over a single WebSocket that is pinged every 2s and killed after two missed
-pongs, the installer writes a managed `typert-gateway` override (`websocketHeartbeatIntervalMs: 15000`) into
-the profile patch, passes `--proxy-keepalive-timeout 60s` to cloudflared, raises the origin `keepAliveTimeout`
+Because the GUI keeps a WebSocket to the Host that DSH pings every 2s and kills after two missed pongs, the
+installer writes a managed `typert-gateway` override (`websocketHeartbeatIntervalMs: 30000`) into the profile
+patch, stretching the tolerated silence to 60-90 s, passes `--proxy-keepalive-timeout 60s` to cloudflared, raises the origin `keepAliveTimeout`
 (`keepAliveMs`, default 65s) and rotates tunnel logs on disk. The first two need one Desktop restart. The
 supervisor also polls the public URL itself (`healthCheckMs`, 15s) and restarts cloudflared after
 `healthFailures` (3) consecutive misses, because a dead edge connection — a quick tunnel whose record is gone,

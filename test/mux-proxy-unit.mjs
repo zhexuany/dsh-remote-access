@@ -312,14 +312,47 @@ check('downlink wire bytes are below the raw bytes', stats.downlinkWireBytes > 0
 check('compressed bytes are less than raw bytes', stats.compressedBytes > 0 && stats.compressedBytes < stats.downlinkRawBytes)
 check('active connections are back to zero', stats.activeConnections === 0, String(stats.activeConnections))
 check('recent frame samples are recorded', stats.recentFrames.length > 0)
+check('a page-side close is attributed to the browser', stats.closedBy.browser >= 1, JSON.stringify(stats.closedBy))
+check('no failure is invented for a clean teardown', stats.closedBy.failure === 0, JSON.stringify(stats.closedBy))
+check('the last close records a browser reason', String(stats.lastClose?.reason ?? '').startsWith('browser-'), JSON.stringify(stats.lastClose))
 check(
   'recent frame samples record the chunk count',
   stats.recentFrames.some((sample) => sample.chunks === totalChunks && sample.stripped === ASSISTANT_MESSAGES),
   JSON.stringify(stats.recentFrames.map((sample) => sample.chunks))
 )
 
+// ── a browser-initiated CLOSE is acknowledged ──────────────────────────────
+// The page closing the tab sends a CLOSE frame and expects one back; without the
+// echo browsers report 1006 and the proxy would be blamed for a clean close.
+const closer = await clientHandshake({
+  host: '127.0.0.1',
+  port: proxyPort,
+  path: '/remote-access/mux?deflate=1',
+  headers: { host: 'junction-burke-solving-was.trycloudflare.com' },
+  timeoutMs: 5_000
+})
+const closeAcks = []
+const closeParser = new FrameParser({
+  onControl: (opcode, payload) => {
+    if (opcode === OP.CLOSE) closeAcks.push(payload.length >= 2 ? payload.readUInt16BE(0) : 1005)
+  }
+})
+if (closer.leftover.length > 0) closeParser.push(closer.leftover)
+closer.socket.on('data', (chunk) => closeParser.push(chunk))
+closer.socket.write(encodeFrame(OP.CLOSE, Buffer.from([0x03, 0xe8]), { mask: true }))
+await new Promise((resolve) => setTimeout(resolve, 400))
+check('browser CLOSE is echoed with the same code', closeAcks.includes(1000), JSON.stringify(closeAcks))
+const closeStats = proxy.stats()
+check(
+  'a browser-initiated close is not blamed on the upstream',
+  closeStats.closedBy.upstream === 0 && closeStats.lastClose?.browserCode === 1000,
+  JSON.stringify(closeStats.lastClose)
+)
+
 // ── teardown ───────────────────────────────────────────────────────────────
 proxy.dispose()
+const afterDispose = proxy.stats()
+check('plugin unload never invents a failure', afterDispose.closedBy.failure === 0 && afterDispose.activeConnections === 0, JSON.stringify(afterDispose.closedBy))
 for (const socket of upstreamSockets) socket.destroy()
 await new Promise((resolve) => proxyServer.close(resolve))
 await new Promise((resolve) => upstream.close(resolve))

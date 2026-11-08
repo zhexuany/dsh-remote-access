@@ -39,5 +39,20 @@ jobs:
       - name: Installer unit tests
         run: node test/installer-unit.mjs
 
+      - name: WebSocket primitives unit tests
+        run: node test/ws-unit.mjs
+
+      - name: Mux proxy unit tests
+        run: node test/mux-proxy-unit.mjs
+
+      - name: Stream strip unit tests
+        run: node test/stream-strip-unit.mjs
+
+      - name: Mux chunk unit tests
+        run: node test/mux-chunk-unit.mjs
+
+      - name: Filesystem browse unit tests
+        run: node test/fs-browse-unit.mjs
+
       - name: Client panel smoke (offline)
         run: node test/client-smoke.mjs

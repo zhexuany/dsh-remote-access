@@ -139,7 +139,8 @@ function installClientConfig(ctx, config, logger, muxProxy) {
     stripStreamingReplay: config.stripStreamingReplay,
     muxChunkBytes: config.muxChunkBytes,
     rpcCacheMs: config.rpcCacheMs,
-    remoteDirectoryPicker: config.remoteDirectoryPicker
+    remoteDirectoryPicker: config.remoteDirectoryPicker,
+    wsDiagnostics: config.wsDiagnostics
   }).replaceAll('<', '\\u003c')
   const tag = `<script>window.__REMOTE_ACCESS__=${payload}</script>`
   try {

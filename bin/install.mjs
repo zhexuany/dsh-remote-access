@@ -11,7 +11,7 @@
  *   node bin/install.mjs                      # install into ~/.dsh/profiles/desktop
  *   node bin/install.mjs --link               # symlink instead of copy (dev loop)
  *   node bin/install.mjs --enable-browser-access
- *   node bin/install.mjs --heartbeat-ms 15000     # tolerate a lossy tunnel path
+ *   node bin/install.mjs --heartbeat-ms 30000     # tolerate a lossy tunnel path
  *   node bin/install.mjs --no-heartbeat           # drop the managed block again
  *   node bin/install.mjs --uninstall
  */
@@ -121,7 +121,7 @@ Usage: node bin/install.mjs [options]
   --copy                     copy the package (default)
   --enable-browser-access    set browserAccess: true in desktop-preferences.json
                              (only DSH Desktop <= 0.2.1-rc.2 reads it; 0.2.1-rc.3 removed the switch)
-  --heartbeat-ms <ms>        Remote-stream mux heartbeat interval (default 15000, 0 = keep DSH's 2000)
+  --heartbeat-ms <ms>        Remote-stream mux heartbeat interval (default 30000, 0 = keep DSH's 2000)
   --no-heartbeat             remove the managed mux heartbeat block
   --no-cloudflared           skip placing the bundled cloudflared binary
   --uninstall                remove the bundle from the profile
@@ -305,15 +305,16 @@ function assertPatchArray(text, file, report) {
  */
 async function applyGatewayHeartbeat(profileDir, options, report) {
   const file = path.join(profileDir, 'cordis.patch.yml')
-  const wanted = options.heartbeatMs === undefined ? 15_000 : options.heartbeatMs
+  const wanted = options.heartbeatMs === undefined ? 30_000 : options.heartbeatMs
   const existing = (await exists(file)) ? await readFile(file, 'utf8') : ''
   const stripped = stripHeartbeatBlock(existing)
   const base = wanted ? dropEmptyDocument(stripped) : stripped
   const block = wanted
     ? [
         HEARTBEAT_BEGIN,
-        `# 2s pings with a 2-missed-ping kill is too tight for a WAN path; ${wanted}ms`,
-        '# means two lost pings still span tens of seconds. A row config replaces the',
+        `# DSH pings the mux every 2s and kills a peer after 2 missed pongs, which is`,
+        `# too tight for a WAN path. ${wanted}ms means two lost pings span`,
+        `# ${Math.round((wanted * 2) / 1000)}s before the socket is reaped. A row config replaces the`,
         '# whole config, so this is the only key we add — never merge assumptions.',
         '- id: typert-gateway',
         "  name: '@deepseek-ai/dsh-api-gateway'",
@@ -429,7 +430,7 @@ async function install(home, options) {
     profileDir,
     installDir,
     mode: options.link ? 'link' : 'copy',
-    heartbeatMs: options.heartbeatMs === undefined ? 15_000 : options.heartbeatMs,
+    heartbeatMs: options.heartbeatMs === undefined ? 30_000 : options.heartbeatMs,
     version: manifest.version,
     bundles: [...previous.filter((n) => n !== BUNDLE_NAME), BUNDLE_NAME],
     report

@@ -1043,6 +1043,81 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * Report the lifecycle of every page WebSocket to the Host.
+     *
+     * The "reconnecting" banner is usually caused by a socket the mux proxy
+     * never sees (the sidebar stream), so the mux counters alone cannot name
+     * the culprit. This wraps `window.WebSocket` for remote pages only and
+     * batches close reports to `/remote-access/ws-report`; the Host keeps the
+     * last 20 and exposes them as `status().wsRecent`.
+     */
+    function installWebSocketProbe() {
+      if (remoteConfig?.wsDiagnostics === false) return
+      if (isLoopbackBrowser()) return
+      if (typeof window === 'undefined' || typeof window.WebSocket !== 'function') return
+      const Native = window.WebSocket
+      if (Native.__remoteAccessProbed) return
+      const pending = []
+      let flushing = false
+      const flush = () => {
+        if (flushing || pending.length === 0) return
+        flushing = true
+        const batch = pending.splice(0, pending.length)
+        try {
+          fetch('/remote-access/ws-report', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sockets: batch }),
+            keepalive: true,
+            credentials: 'same-origin'
+          })
+            .catch(() => {})
+            .finally(() => {
+              flushing = false
+              flush()
+            })
+        } catch {
+          flushing = false
+        }
+      }
+      const describe = (rawUrl) => {
+        try {
+          const parsed = new URL(String(rawUrl), document.baseURI)
+          return `${parsed.protocol}//${parsed.host}${parsed.pathname}`
+        } catch {
+          return String(rawUrl).split('?')[0].slice(0, 200)
+        }
+      }
+      const track = (socket, rawUrl) => {
+        if (!socket || typeof socket.addEventListener !== 'function') return
+        const entry = { url: describe(rawUrl), openedAt: Date.now(), closedAt: null, code: null, reason: '', frameCount: 0 }
+        socket.addEventListener('message', () => {
+          entry.frameCount += 1
+        })
+        socket.addEventListener('close', (event) => {
+          entry.closedAt = Date.now()
+          entry.lifetimeMs = entry.closedAt - entry.openedAt
+          entry.code = typeof event?.code === 'number' ? event.code : null
+          entry.reason = typeof event?.reason === 'string' ? event.reason.slice(0, 120) : ''
+          pending.push(entry)
+          flush()
+        })
+      }
+      function ProbedWebSocket(url, protocols) {
+        const socket = protocols === undefined ? new Native(url) : new Native(url, protocols)
+        track(socket, url)
+        return socket
+      }
+      ProbedWebSocket.prototype = Native.prototype
+      for (const key of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) ProbedWebSocket[key] = Native[key]
+      ProbedWebSocket.__remoteAccessProbed = true
+      window.WebSocket = ProbedWebSocket
+      if (typeof window.addEventListener === 'function') {
+        window.addEventListener('pagehide', flush)
+      }
+    }
+
     return {
       name: 'dsh-remote-access',
       inject: ['slots', 'connection'],
@@ -1066,6 +1141,11 @@ window.__ModuleLoader__.load({
           installRemoteDirectoryPicker(ctx)
         } catch (error) {
           console.warn('[remote-access] remote directory picker patch failed', error)
+        }
+        try {
+          installWebSocketProbe()
+        } catch (error) {
+          console.warn('[remote-access] websocket probe failed', error)
         }
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

@@ -109,8 +109,8 @@ async function main() {
     /* 1 — a real install */
     const first = await installer(home, ['--profile', 'web', '--no-cloudflared'])
     check('install reports the bundle name', first.action === 'install' && first.installDir.endsWith(path.join('node_modules', BUNDLE)), String(first.installDir))
-    check('install reports the default heartbeat', first.heartbeatMs === 15_000, String(first.heartbeatMs))
-    check('install says it set the heartbeat', first.report.some((line) => /set the Remote-stream mux heartbeat to 15000ms/.test(line)), JSON.stringify(first.report))
+    check('install reports the default heartbeat', first.heartbeatMs === 30_000, String(first.heartbeatMs))
+    check('install says it set the heartbeat', first.report.some((line) => /set the Remote-stream mux heartbeat to 30000ms/.test(line)), JSON.stringify(first.report))
     check('the bundle directory exists', await exists(path.join(profileDir, 'node_modules', BUNDLE, 'index.js')))
 
     const manifest = JSON.parse(await readFile(manifestFile, 'utf8'))
@@ -120,7 +120,7 @@ async function main() {
     check('the manifest was backed up first', (await readdir(profileDir)).some((name) => name.startsWith('package.json.bak-')), JSON.stringify(await readdir(profileDir)))
 
     const patch = await readFile(patchFile, 'utf8')
-    check('the heartbeat row is written', /- id: typert-gateway/.test(patch) && /websocketHeartbeatIntervalMs: 15000/.test(patch), patch.slice(-220))
+    check('the heartbeat row is written', /- id: typert-gateway/.test(patch) && /websocketHeartbeatIntervalMs: 30000/.test(patch), patch.slice(-220))
     check('the row keeps its package name', /name: '@deepseek-ai\/dsh-api-gateway'/.test(patch))
     check('hand-written entries survive', /preference: zh/.test(patch), patch.slice(0, 200))
     check('the block is marker-delimited', patch.includes('# >>> dsh-remote-access: mux heartbeat (managed block)') && patch.includes('# <<< dsh-remote-access: mux heartbeat (managed block)'))
@@ -129,8 +129,20 @@ async function main() {
     const second = await installer(home, ['--profile', 'web', '--no-cloudflared'])
     const patchAgain = await readFile(patchFile, 'utf8')
     check('a re-install is idempotent', patchAgain === patch, 'the patch file changed on the second run')
-    check('a re-install says the heartbeat is already set', second.report.some((line) => /mux heartbeat already 15000ms/.test(line)), JSON.stringify(second.report))
+    check('a re-install says the heartbeat is already set', second.report.some((line) => /mux heartbeat already 30000ms/.test(line)), JSON.stringify(second.report))
     check('a re-install keeps one bundles entry', second.bundles.filter((name) => name === BUNDLE).length === 1, JSON.stringify(second.bundles))
+
+    /* 2b — an old profile still carrying the 15000 managed block is migrated */
+    const legacy = patchAgain.replace(/websocketHeartbeatIntervalMs: 30000/, 'websocketHeartbeatIntervalMs: 15000')
+    await writeFile(patchFile, legacy)
+    const migrated = await installer(home, ['--profile', 'web', '--no-cloudflared'])
+    const migratedPatch = await readFile(patchFile, 'utf8')
+    check(
+      'a profile written by an older installer is upgraded to 30000',
+      /websocketHeartbeatIntervalMs: 30000/.test(migratedPatch) && !/websocketHeartbeatIntervalMs: 15000/.test(migratedPatch),
+      migratedPatch.slice(-220)
+    )
+    check('the upgrade is reported', migrated.report.some((line) => /set the Remote-stream mux heartbeat to 30000ms/.test(line)), JSON.stringify(migrated.report))
 
     /* 3 — a custom interval */
     const custom = await installer(home, ['--profile', 'web', '--no-cloudflared', '--heartbeat-ms', '5000'])
@@ -189,7 +201,7 @@ async function main() {
       'the heartbeat row survived the rewrite',
       yaml === null ||
         (doc ?? []).some(
-          (row) => row?.id === 'typert-gateway' && row?.config?.websocketHeartbeatIntervalMs === 15_000
+          (row) => row?.id === 'typert-gateway' && row?.config?.websocketHeartbeatIntervalMs === 30_000
         ),
       yaml ? JSON.stringify(doc) : 'no parser'
     )

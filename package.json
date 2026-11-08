@@ -23,7 +23,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node test/service-unit.mjs && node test/installer-unit.mjs",
+    "test": "node test/service-unit.mjs && node test/installer-unit.mjs && node test/ws-unit.mjs && node test/mux-proxy-unit.mjs && node test/stream-strip-unit.mjs && node test/mux-chunk-unit.mjs && node test/fs-browse-unit.mjs",
     "test:service": "node test/service-unit.mjs",
     "test:installer": "node test/installer-unit.mjs",
     "test:client": "node test/client-smoke.mjs"

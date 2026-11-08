@@ -114,6 +114,23 @@ async function main() {
     check('rpcCacheMs: 0 disables the client RPC cache', normalizeConfig({ rpcCacheMs: 0 }).rpcCacheMs === 0)
     check('the remote directory picker is on by default', muxDefaults.remoteDirectoryPicker === true)
     check('the remote directory picker can be disabled', normalizeConfig({ remoteDirectoryPicker: false }).remoteDirectoryPicker === false)
+    check('websocket diagnostics are on by default', muxDefaults.wsDiagnostics === true)
+    check('websocket diagnostics can be disabled', normalizeConfig({ wsDiagnostics: false }).wsDiagnostics === false)
+    {
+      const reporter = buildService({ home }).service
+      const stored = reporter.recordSocketReports([
+        { url: 'wss://dsh.example.com/sidebar/ws/agent-opens?sessionId=abc', openedAt: 1, closedAt: 3, code: 1006, reason: 'r'.repeat(400), lifetimeMs: 2, frameCount: 5 },
+        { url: 42, openedAt: 'not-a-number' },
+        null
+      ])
+      const view = reporter.status()
+      check('socket reports are sanitised and stored', stored === 2 && view.wsRecent.length === 2, String(stored))
+      check(
+        'the last socket report keeps its close code and clamps long text',
+        view.wsRecent[0]?.code === 1006 && view.wsRecent[0]?.reason.length === 120 && view.wsRecent[0]?.openedAt === 1 && view.wsRecent[1]?.openedAt === null,
+        JSON.stringify(view.wsRecent[0])
+      )
+    }
     check(
       'a Host answer counts as a healthy probe',
       [200, 303, 401, 403].every((code) => isHealthyTunnelStatus(code)),
@@ -272,6 +289,34 @@ async function main() {
     /* 10 — the proxy pool must retire before the origin socket */
     const planned = planTunnel(normalizeConfig({ home, provider: 'cloudflare-quick' }), 'http://127.0.0.1:18790', home)
     check('cloudflared proxy keepalive is shorter than origin keepalive', planned.args.includes('--proxy-keepalive-timeout') && planned.args.includes('60s'), JSON.stringify(planned.args))
+    /* 10b — edge addressing and the retry budget are opt-in flags */
+    check('edge IP version stays auto by default', normalizeConfig({}).edgeIpVersion === 'auto')
+    check('edge IP version accepts 4 and rejects junk', normalizeConfig({ edgeIpVersion: 4 }).edgeIpVersion === '4' && normalizeConfig({ edgeIpVersion: 'x' }).edgeIpVersion === 'auto')
+    const pinned = planTunnel(normalizeConfig({ home, provider: 'cloudflare-quick', edgeIpVersion: '4', tunnelRetries: 9 }), 'http://127.0.0.1:18790', home)
+    check('pinned edge IP version reaches cloudflared', pinned.args.includes('--edge-ip-version') && pinned.args.includes('4'), JSON.stringify(pinned.args))
+    check(
+      'status exposes edge version and retries',
+      (() => {
+        const view = buildService({ home }).service.status()
+        return view.edgeIpVersion === 'auto' && view.tunnelRetries === 5
+      })()
+    )
+    check('an empty retry value falls back to 5', normalizeConfig({ tunnelRetries: '' }).tunnelRetries === 5)
+    check('retry budget reaches cloudflared', pinned.args.includes('--retries') && pinned.args.includes('9'), JSON.stringify(pinned.args))
+    check('auto edge IP version is not forced onto cloudflared', !planned.args.includes('--edge-ip-version'), JSON.stringify(planned.args))
+    check('retries default to 5 and clamp to 1..20', normalizeConfig({}).tunnelRetries === 5 && normalizeConfig({ tunnelRetries: 99 }).tunnelRetries === 20 && normalizeConfig({ tunnelRetries: 0 }).tunnelRetries === 1)
+    /* 10c — a named tunnel only accepts these flags before its `run` subcommand */
+    const namedPlan = planTunnel(
+      normalizeConfig({ home, provider: 'cloudflare-named', tunnelToken: 't', hostname: 'h.example.com', edgeIpVersion: '4', tunnelRetries: 9 }),
+      'http://127.0.0.1:18790',
+      home
+    )
+    const runAt = namedPlan.args.indexOf('run')
+    check(
+      'named tunnel flags sit before the run subcommand',
+      runAt > 0 && namedPlan.args.indexOf('--edge-ip-version') < runAt && namedPlan.args.indexOf('--retries') < runAt,
+      JSON.stringify(namedPlan.args)
+    )
   } finally {
     restore()
     await rm(home, { recursive: true, force: true })
