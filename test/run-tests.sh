@@ -68,6 +68,10 @@ echo "== mux proxy unit (compressed tunnel transport) =="
 run "$ROOT/test/mux-proxy-unit.mjs"
 
 echo
+echo "== fs browse unit (remote folder chooser) =="
+run "$ROOT/test/fs-browse-unit.mjs"
+
+echo
 echo "== client panel smoke =="
 if [ -n "$1" ]; then
   if [ -n "$2" ]; then

@@ -26,11 +26,12 @@
 - [7. 配置](#7-配置)
 - [8. 连接稳定性](#8-连接稳定性)
 - [9. 会话切换速度](#9-会话切换速度)
-- [10. 运行时文件](#10-运行时文件)
-- [11. 排错](#11-排错)
-- [12. 已知限制](#12-已知限制)
-- [13. 开发与测试](#13-开发与测试)
-- [14. 许可证](#14-许可证)
+- [10. 远端选择工作区目录](#10-远端选择工作区目录)
+- [11. 运行时文件](#11-运行时文件)
+- [12. 排错](#12-排错)
+- [13. 已知限制](#13-已知限制)
+- [14. 开发与测试](#14-开发与测试)
+- [15. 许可证](#15-许可证)
 
 ## 1. 它解决什么问题
 
@@ -289,6 +290,7 @@ SSH 里，不经过 Cloudflare。
 | `stripStreamingReplay` | `true` | 压缩前把历史消息里回放的 `data.stream` 事件置空（−48% 体积），只影响经 mux 代理的下行帧 |
 | `muxChunkBytes` | `262144` | 压缩后的帧再切成多大的 `DSHD1` 分块（16 KiB–1 MiB）；避免单条巨帧卡住隧道 |
 | `rpcCacheMs` | `30000` | 切换会话时只读 RPC（skills/commands/agentPresets 等 6 个）的客户端缓存 TTL；`0` = 关闭 |
+| `remoteDirectoryPicker` | `true` | 远端页面用插件自绘的目录浏览对话框代替会阻塞的 macOS 原生面板（§10）；本机回环始终用原生面板 |
 | `tunnelLogLevel` | `info` | 传给 cloudflared 的 `--loglevel`（`debug` 能看清边缘连接细节） |
 | `tunnelLogBytes` | `1000000` | 日志超过这个字节数就滚成 `tunnel.log.1` |
 | `home` | 自动探测 | 强制指定 `DSH_HOME` |
@@ -364,7 +366,29 @@ Host 冷读 zstd 文件影响，收益不是线性的。`status` 里的 `mux` �
 
 这些补丁都在浏览器侧落地：更新 Host 代码后需要重启一次 Desktop，并硬刷新浏览器页面。
 
-## 10. 运行时文件
+## 10. 远端选择工作区目录
+
+点击侧边栏的「添加工作区」时，Host 默认挂的是 `@deepseek-ai/dsh-host-directory-picker-auto`：它在 **boot 时**
+按 `connection.allowsRemoteAuthorities` 与环境一次性选后端（本机选 `native`，SSH/远端绑定选 `browse`）。
+隧道域名是在隧道起来之后才写进信任列表的，所以 boot 时永远选到 `native` —— 而后端一旦选定，运行期间不能
+替换。于是远端浏览器点「添加工作区」时，Host 会在**那台 Mac 的屏幕上**弹出 `NSOpenPanel` 并阻塞等待；远端
+用户看不到任何窗口，`directoryPicker/pick` 一直不返回，最后被 Cloudflare 以 100 秒超时收尾：
+
+```
+directory picker failed: client api: directoryPicker/pick failed: transport failure for
+/api/directoryPicker/pick: HTTP 524
+```
+
+插件因此在**远端页面**接管 `uiWorkspace.pickDirectory()`，用自己的对话框代替原生面板：Host 侧提供
+`/remote-access/fs`（`GET ?path=` 只列一层子目录，`POST {op:'mkdir',path,name}` 建单段目录，最多 500 条），
+页面里渲染遮罩 + 目录列表 + 「上一层 / 新建文件夹 / 取消 / 使用此目录」。选中的绝对路径照常交给
+`uiWorkspace` 走原来的建工作区流程。**回环直连（本机浏览器 / Desktop 窗口）不受影响，仍然用系统原生选择器。**
+
+- 关闭：`remoteDirectoryPicker: false`（此时远端点击仍会落到原生面板并可能 524）。
+- 认证：`/remote-access/fs` 与其它插件接口一样走 Host 的 launch-token → cookie 校验，未认证返回 401。
+- 能力边界：只列目录、不读文件内容；`mkdir` 只接受单个目录名，且不递归创建。
+
+## 11. 运行时文件
 
 ```
 <DSH_HOME>/remote-access/          # 目录权限 0700
@@ -377,7 +401,7 @@ Host 冷读 zstd 文件影响，收益不是线性的。`status` 里的 `mux` �
 
 `state.json` 记住上次是运行还是停止，Desktop 重启后由 `autoStart` 与它共同决定是否恢复隧道。
 
-## 11. 排错
+## 12. 排错
 
 | 现象 | 处理 |
 |------|------|
@@ -391,7 +415,7 @@ Host 冷读 zstd 文件影响，收益不是线性的。`status` 里的 `mux` �
 | `ssh -L` 打开却 401 | 本机链接按 `host:port` 签发，换端口后重新复制一次 |
 | 改了源码但界面没变化 | 面板改动刷新页面即可；Host 侧改动必须重启 Desktop，因为 Host 不会重载已 import 的模块 |
 
-## 12. 已知限制
+## 13. 已知限制
 
 - 目标只能是本机回环上的 DSH Host（不做「转发到另一台机器」）。
 - 主要验证平台是 macOS。Windows 上核心逻辑（隧道、围栏、面板）是纯 Node，可以运行；但 `bin/dsh-remote-access`
@@ -405,7 +429,7 @@ Host 冷读 zstd 文件影响，收益不是线性的。`status` 里的 `mux` �
   视觉细节不会与 Desktop 自带设置页完全一致。
 - 「重新连接中」只能被降低概率，不能被消灭（§8）。
 
-## 13. 开发与测试
+## 14. 开发与测试
 
 ```sh
 ./test/run-tests.sh   # 离线测试：service-unit + installer-unit + client-smoke
@@ -423,7 +447,7 @@ CI（`.github/workflows/ci.yml`）在 `macos-latest` + Node 22 上跑语法检�
 
 欢迎 issue 与 PR；提交信息使用 Conventional Commits。
 
-## 14. 许可证
+## 15. 许可证
 
 Apache License 2.0，全文见 [LICENSE](LICENSE)。著作权与归属见 [NOTICE](NOTICE)：
 

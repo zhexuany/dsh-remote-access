@@ -112,6 +112,8 @@ async function main() {
     check('muxChunkBytes is clamped to 16 KiB..1 MiB', normalizeConfig({ muxChunkBytes: 1 }).muxChunkBytes === 16_384 && normalizeConfig({ muxChunkBytes: 9_000_000 }).muxChunkBytes === 1_048_576)
     check('the RPC cache defaults to 30s', muxDefaults.rpcCacheMs === 30_000, String(muxDefaults.rpcCacheMs))
     check('rpcCacheMs: 0 disables the client RPC cache', normalizeConfig({ rpcCacheMs: 0 }).rpcCacheMs === 0)
+    check('the remote directory picker is on by default', muxDefaults.remoteDirectoryPicker === true)
+    check('the remote directory picker can be disabled', normalizeConfig({ remoteDirectoryPicker: false }).remoteDirectoryPicker === false)
     check(
       'a Host answer counts as a healthy probe',
       [200, 303, 401, 403].every((code) => isHealthyTunnelStatus(code)),

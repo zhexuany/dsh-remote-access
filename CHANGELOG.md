@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Adding a workspace from a remote browser no longer hangs.** DSH composes the directory picker once, at
+  boot: with a loopback bind and no remote authority trusted yet it picks the `native` backend, whose macOS
+  panel opens on the host's own screen. A remote click therefore queued `directoryPicker/pick`, waited for an
+  `NSOpenPanel` nobody could see, and died on Cloudflare's 100s limit (`HTTP 524`). The client half now
+  replaces `uiWorkspace.pickDirectory()` on remote pages with its own dialog backed by the plugin's
+  `/remote-access/fs` route (list one directory level, create a single-segment folder, 500-entry cap);
+  loopback browsers and the Desktop window keep the native panel. Opt out with `remoteDirectoryPicker: false`.
+  The service is looked up with `ctx.get('uiWorkspace')` plus an `internal/service` listener instead of an
+  `inject` entry — declaring it delayed this whole client half and the mux socket escaped the deflate proxy.
 - Downlink mux frames now carry a much smaller payload: the Host neutralises replayed
   `assistant/message.data.stream` events (≈48% of a real window; `data.stream` becomes `[]`, because client
   trace folding iterates it), deflates the result, and splits it into bounded `DSHD1 <idx> <total>` chunks

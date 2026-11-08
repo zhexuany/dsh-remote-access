@@ -53,6 +53,16 @@ window.__ModuleLoader__.load({
       copyLocal: '复制本机链接',
       failHint: '隧道没有起来。常见原因：网络不可用、cloudflared 缺失、provider 配置不完整。',
       notReady: '还没有连接链接：隧道未就绪。',
+      picker: {
+        title: '选择工作区目录',
+        select: '使用此目录',
+        cancel: '取消',
+        up: '上一层',
+        newFolder: '新建文件夹',
+        loading: '正在读取目录…',
+        empty: '这个目录里没有子文件夹',
+        error: '读不到这个目录'
+      },
       security: '注意：隧道一旦就绪，任何拿到这条链接的人都能操作这台机器上的 DSH。不用时请点「停止」。'
     }
     const en = {
@@ -97,6 +107,16 @@ window.__ModuleLoader__.load({
       copyLocal: 'Copy local link',
       failHint: 'The tunnel did not come up. Usual causes: no network, cloudflared missing, incomplete provider config.',
       notReady: 'No share link yet: the tunnel is not ready.',
+      picker: {
+        title: 'Choose a workspace folder',
+        select: 'Use this folder',
+        cancel: 'Cancel',
+        up: 'Up one level',
+        newFolder: 'New folder',
+        loading: 'Reading the folder…',
+        empty: 'No subfolders here',
+        error: 'Cannot read this folder'
+      },
       security: 'Note: once the tunnel is ready, anyone holding this link can drive DSH on this machine. Stop it when you are done.'
     }
 
@@ -832,6 +852,197 @@ window.__ModuleLoader__.load({
       proto.__remoteAccessWindowPatched = true
     }
 
+    function makeElement(tag, style, text) {
+      const element = document.createElement(tag)
+      if (style) Object.assign(element.style, style)
+      if (text !== undefined) element.textContent = text
+      return element
+    }
+
+    /**
+     * The Host composition resolves its directory picker once, at boot, and on a
+     * macOS Desktop that is the `native` backend: `pick` opens an NSOpenPanel on
+     * the Host's own screen. A phone or another computer never sees that panel,
+     * so the RPC never settles and "add workspace" looks broken. A remote page
+     * renders its own chooser over `/remote-access/fs` instead.
+     */
+    function openRemoteDirectoryDialog() {
+      const labels = strings().picker
+      return new Promise((resolve) => {
+        let settled = false
+        let current = null
+        const finish = (value) => {
+          if (settled) return
+          settled = true
+          document.removeEventListener('keydown', onKey, true)
+          overlay.remove()
+          resolve(value)
+        }
+        const opaque = 'color-mix(in srgb, CanvasText 14%, transparent)'
+        const overlay = makeElement('div', {
+          position: 'fixed',
+          inset: '0',
+          zIndex: '2147483000',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '16px',
+          background: 'color-mix(in srgb, CanvasText 45%, transparent)'
+        })
+        const panel = makeElement('div', {
+          width: 'min(560px, 100%)',
+          maxHeight: '86vh',
+          display: 'flex',
+          flexDirection: 'column',
+          background: 'Canvas',
+          color: 'CanvasText',
+          borderRadius: '12px',
+          border: `1px solid ${opaque}`,
+          boxShadow: '0 18px 60px rgba(0, 0, 0, 0.35)',
+          font: '14px/1.45 system-ui, -apple-system, sans-serif',
+          overflow: 'hidden'
+        })
+        const header = makeElement('div', { padding: '14px 16px 10px', borderBottom: `1px solid ${opaque}` })
+        const pathLine = makeElement('div', { marginTop: '4px', opacity: '0.7', fontSize: '12px', wordBreak: 'break-all' }, '…')
+        header.append(makeElement('div', { fontWeight: '600', fontSize: '15px' }, labels.title), pathLine)
+        const list = makeElement('div', { flex: '1', minHeight: '220px', overflowY: 'auto' })
+        const footer = makeElement('div', {
+          display: 'flex',
+          gap: '8px',
+          padding: '12px 16px',
+          borderTop: `1px solid ${opaque}`,
+          flexWrap: 'wrap',
+          justifyContent: 'flex-end'
+        })
+        const button = (label, primary) => {
+          const element = makeElement('button', {
+            padding: '9px 14px',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            fontSize: '14px',
+            background: primary ? 'Highlight' : 'transparent',
+            color: primary ? 'HighlightText' : 'CanvasText',
+            border: primary ? '1px solid transparent' : `1px solid color-mix(in srgb, CanvasText 28%, transparent)`
+          }, label)
+          element.type = 'button'
+          return element
+        }
+        const upButton = button(labels.up, false)
+        upButton.disabled = true
+        upButton.addEventListener('click', () => {
+          if (current?.parent) void render(current.parent)
+        })
+        const newButton = button(labels.newFolder, false)
+        newButton.addEventListener('click', async () => {
+          if (!current) return
+          const name = window.prompt(labels.newFolder, '')
+          if (!name) return
+          try {
+            const response = await fetch('/remote-access/fs', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ op: 'mkdir', path: current.path, name })
+            })
+            const data = await response.json()
+            if (!response.ok) throw new Error(data?.error ?? `HTTP ${response.status}`)
+            await render(data.path)
+          } catch (error) {
+            window.alert(`${labels.error}: ${error?.message ?? error}`)
+          }
+        })
+        const cancelButton = button(labels.cancel, false)
+        cancelButton.addEventListener('click', () => finish(null))
+        const selectButton = button(labels.select, true)
+        selectButton.addEventListener('click', () => finish(current?.path ?? null))
+        footer.append(upButton, newButton, cancelButton, selectButton)
+        panel.append(header, list, footer)
+        overlay.append(panel)
+        overlay.addEventListener('click', (event) => {
+          if (event.target === overlay) finish(null)
+        })
+        const onKey = (event) => {
+          if (event.key === 'Escape') {
+            event.stopPropagation()
+            finish(null)
+          }
+        }
+        document.addEventListener('keydown', onKey, true)
+
+        async function render(target) {
+          list.textContent = ''
+          list.append(makeElement('div', { padding: '12px 16px', opacity: '0.7' }, labels.loading))
+          let data
+          try {
+            const query = target ? `?path=${encodeURIComponent(target)}` : ''
+            const response = await fetch(`/remote-access/fs${query}`, { credentials: 'same-origin', cache: 'no-store' })
+            data = await response.json()
+            if (!response.ok) throw new Error(data?.error ?? `HTTP ${response.status}`)
+          } catch (error) {
+            list.textContent = ''
+            list.append(makeElement('div', { padding: '12px 16px', color: 'Crimson' }, `${labels.error}: ${error?.message ?? error}`))
+            return
+          }
+          current = data
+          pathLine.textContent = data.path
+          upButton.disabled = !data.parent
+          list.textContent = ''
+          if (data.entries.length === 0) {
+            list.append(makeElement('div', { padding: '12px 16px', opacity: '0.7' }, labels.empty))
+            return
+          }
+          for (const entry of data.entries) {
+            const row = makeElement('button', {
+              display: 'block',
+              width: '100%',
+              padding: '11px 16px',
+              textAlign: 'left',
+              fontSize: '14px',
+              background: 'transparent',
+              color: 'inherit',
+              border: 'none',
+              borderBottom: `1px solid ${opaque}`,
+              cursor: 'pointer'
+            }, `📁  ${entry.name}`)
+            row.type = 'button'
+            row.addEventListener('click', () => void render(entry.path))
+            list.append(row)
+          }
+        }
+
+        // Mounted on <html>, not <body>: the client half must not mutate the page
+        // during load, and the panel only exists for the lifetime of one pick.
+        document.documentElement.append(overlay)
+        void render()
+      })
+    }
+
+    function installRemoteDirectoryPicker(ctx) {
+      if (remoteConfig?.remoteDirectoryPicker === false) return
+      if (isLoopbackBrowser()) return
+      if (typeof document === 'undefined') return
+      const patch = (ui) => {
+        if (!ui || typeof ui.pickDirectory !== 'function' || ui.__remoteAccessPickerPatched) return false
+        ui.pickDirectory = function pickDirectoryForRemotePeer() {
+          return openRemoteDirectoryDialog()
+        }
+        ui.__remoteAccessPickerPatched = true
+        return true
+      }
+      // Read the service without an `inject` entry: adding `uiWorkspace` to the
+      // plugin's inject list would delay this whole client half (mux transport
+      // patch included) until the workspace UI service starts, and the mux has
+      // usually opened by then.
+      const existing = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined
+      if (patch(existing)) return
+      if (typeof ctx.on !== 'function') return
+      const dispose = ctx.on('internal/service', (name, value) => {
+        if (name !== 'uiWorkspace') return
+        if (!patch(value)) return
+        dispose?.()
+      })
+    }
+
     return {
       name: 'dsh-remote-access',
       inject: ['slots', 'connection'],
@@ -850,6 +1061,11 @@ window.__ModuleLoader__.load({
           installWindowPatch()
         } catch (error) {
           console.warn('[remote-access] window patch failed', error)
+        }
+        try {
+          installRemoteDirectoryPicker(ctx)
+        } catch (error) {
+          console.warn('[remote-access] remote directory picker patch failed', error)
         }
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
